@@ -17,7 +17,7 @@ base64_gateware were read for reference only; no code was taken from them.
 | Exceptions | format $0/$1/$2/$A frames, VBR, MSP/ISP (M bit), interrupt throwaway frame, T1/T0 trace, address error on odd PC, bus error (restart model), double-fault halt |
 | Cache | 64 x 32-bit direct-mapped instruction cache (CACR E/F/CE/C, CAAR), coherent with the core's own writes |
 | Verification | lockstep against Musashi (68020): 9 directed programs + over 1.3 million random single-instruction tests, run both on the native bus and through the 68000-bus wrapper. 0 open mismatches |
-| Size | core + wrapper ~14.3k LUT4 + 880 carry cells, 1 DSP, 2 EBR. The full Base64 design with this core fits the LFE5U-25F (see doc/integration.md) |
+| Size | core + wrapper ~14.3k LUT4 + 880 carry cells, 1 DSP, 2 EBR. The full Base64 design with this core in place of fx68k uses 76% of the LFE5U-25F logic (nextpnr) |
 | Speed | nextpnr Fmax of the core ~31 MHz, so the wrapper runs it at 85 MHz / 3 = 28.4 MHz (`CE_DIV=3`). About 5.9 clocks per instruction on a cached integer loop |
 | Hardware | **not yet run on a Base64.** Diamond build + board bring-up are the next step |
 

@@ -39,7 +39,7 @@ motherboard sees the same S0..S7 cycles. The core itself runs on a clock enable:
 | `CE_DIV` | core clock | status |
 |---|---|---|
 | 2 | `enPhi1`, 42.6 MHz | target; does not close yet (nextpnr Fmax of the core ~31 MHz) |
-| 3 | clk/3, 28.4 MHz | **use this**; meets timing in nextpnr with margin |
+| 3 | clk/3, 28.4 MHz | **use this**; meets timing in nextpnr (thin margin in the full design) |
 | 4 | clk/4, 21.3 MHz | fallback if Diamond disagrees |
 
 Every core flop is enabled by that clock enable, and the wrapper only changes the core's inputs
@@ -65,9 +65,12 @@ fdc comments describe.
 
 ## 4. Resources
 
-The whole Base64 design with this core in place of fx68k (yosys + nextpnr, LFE5U-25F-6BG256C):
-see `syn/b64/b64_result.txt` for the latest run. At v0.3 it was 17.7k of 24.3k logic cells (72%),
-21 of 56 EBR, 1 DSP. Diamond's numbers will differ somewhat but there is headroom.
+The whole Base64 design with this core in place of fx68k (yosys + nextpnr, LFE5U-25F-6BG256C,
+v0.4, `syn/b64/run_b64.sh`): **18.5k of 24.3k logic cells (76%)**, 2.75k flip-flops, 21 of 56
+EBR, 1 DSP. Its worst path is inside the core, 35.06 ns (28.5 MHz). That meets the 3-cycle budget
+at 85.9 MHz (34.9 ns setup + 0.1 ns margin) **only just**. If Diamond's timing report shows the
+core multicycle paths failing, build with `CE_DIV(4)` (and `-setup 4 -hold 3`), which leaves
+about 11 ns of slack.
 
 ## 5. What changes for the Amiga
 

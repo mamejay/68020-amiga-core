@@ -1,1 +1,6 @@
 base64_top_020.sv:661: Warning: Yosys has only limited support for tri-state logic at the moment.
+Info: 	              DP16KD:      21/     56    37%
+Info: 	          TRELLIS_FF:    2754/  24288    11%
+Info: 	        TRELLIS_COMB:   18528/  24288    76%
+Info: Max frequency for clock '$glbnet$clk_12x$TRELLIS_IO_IN': 28.52 MHz (FAIL at 86.01 MHz)
+Warning: Max frequency for clock '$glbnet$clk_12x$TRELLIS_IO_IN': 37.47 MHz (FAIL at 86.01 MHz)
