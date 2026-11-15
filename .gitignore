@@ -1,0 +1,13 @@
+ref/
+sim/obj_dir/
+sim/obj_mus/
+sim/lockstep
+sim/musashi/m68kmake
+sim/musashi/m68kops.c
+sim/musashi/m68kops.h
+sim/.core_src
+sim/tests/*.o
+sim/tests/*.elf
+syn/*.json
+syn/*.log
+*.vcd
