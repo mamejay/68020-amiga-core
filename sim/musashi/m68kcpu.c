@@ -1060,6 +1060,10 @@ void m68k_set_irq(unsigned int int_level)
 	/* Note: Level 7 can also level trigger like a normal IRQ */
 	if(old_level != 0x0700 && CPU_INT_LEVEL == 0x0700)
 		m68ki_cpu.nmi_pending = TRUE;
+
+	/* lockstep harness: the level is raised by the last bus write of an instruction,
+	   so recognise it at this instruction boundary (like an SR change does) */
+	m68ki_check_interrupts();
 }
 
 void m68k_set_virq(unsigned int level, unsigned int active)

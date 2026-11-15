@@ -92,7 +92,7 @@ localparam [4:0] A_ADD=0, A_ADDX=1, A_SUB=2, A_SUBX=3, A_CMP=4, A_NEG=5, A_NEGX=
 // -----------------------------------------------------------------------------
 typedef enum logic [7:0] {
     S_CLR, S_RESET, S_RST1, S_RST2,
-    S_FETCH, S_DECODE, S_END, S_RETIRE, S_STOPPED, S_HALT,
+    S_FETCH, S_DECODE, S_END, S_STOPPED, S_HALT,
     S_MEM, S_IFETCH,
     // effective address engine
     E_START, E_D16, E_ABSW, E_ABSL1, E_ABSL2, E_IMM1, E_IMM2, E_IDX, E_BDW, E_BDL1, E_BDL2,
@@ -108,14 +108,14 @@ typedef enum logic [7:0] {
     S_LINK0, S_LINKL, S_LINK1, S_LINK2, S_LINK3, S_UNLK1, S_UNLK2,
     S_RTS1, S_RTD0, S_RTD1, S_RTR1, S_RTR2,
     S_RTE0, S_RTE1, S_RTE2, S_RTE3, S_RTE4,
-    S_CHK, S_CHK1, S_CHK2X, S_CHK2E, S_CHK2R1, S_CHK2R2, S_CHK2C1, S_CHK2C2, S_CHK2C3,
+    S_CHK, S_CHK1W, S_CHK1, S_CHK2X, S_CHK2E, S_CHK2R1, S_CHK2R2, S_CHK2C1, S_CHK2C2, S_CHK2C3, S_CHK2C4,
     S_MULW, S_MULLX, S_MULL, S_MUL_LOOP, S_MUL_FIN, S_MUL_FIN2,
     S_DIVW, S_DIVLX, S_DIVL, S_DIV_ABS1, S_DIV_ABS2, S_DIV_LOOP, S_DIV_FIN, S_DIV_FIN2,
     S_SHIFT, S_ROX, S_SHIFTM,
     S_BITX, S_BITD, S_BIT,
     S_BFX, S_BFE, S_BF0, S_BF1, S_BF2, S_BF3, S_BF4, S_BF5, S_BF6,
-    S_CASX, S_CASE, S_CAS, S_CAS1,
-    S_CAS2X1, S_CAS2X2, S_CAS2R1, S_CAS2R2, S_CAS2C1, S_CAS2C2, S_CAS2C3,
+    S_CASX, S_CASE, S_CAS, S_CAS1W, S_CAS1,
+    S_CAS2X1, S_CAS2X2, S_CAS2R1, S_CAS2R2, S_CAS2C1, S_CAS2C1W, S_CAS2C2, S_CAS2C2W, S_CAS2C3,
     S_CAS2W1, S_CAS2W2, S_CAS2F1, S_CAS2F2,
     S_PACKX, S_PACKM1, S_PACKM2, S_PACKM3, S_UNPKM1, S_UNPKM2, S_UNPKM3, S_UNPKM4,
     S_MOVECX, S_MOVESX, S_MOVESE, S_MOVES1,
@@ -125,6 +125,7 @@ typedef enum logic [7:0] {
 } state_t;
 
 state_t state, ea_ret, mem_ret, if_ret, g_after_src, g_after_dst;
+state_t END_ST;      // where an instruction goes when it is done: S_FETCH, or S_END to take a trace
 
 // -----------------------------------------------------------------------------
 // helper functions
@@ -345,7 +346,7 @@ function automatic [36:0] shifter(input [1:0] typ, input left, input [1:0] s,
         if (typ == 2'b00 && left) begin   // ASL overflow: top cnt+1 bits not all equal
             m    = (cnt >= 6'd31) ? 32'hFFFF_FFFF : ~(32'hFFFF_FFFF >> (cnt + 6'd1));
             bits = va & m;
-            vf   = !(bits == 32'd0 || bits == m);
+            vf   = (cnt >= w) ? (v != 32'd0) : !(bits == 32'd0 || bits == m);
         end
     end
     shifter = {x, msbs(r, s), r == 32'd0, vf, c, r};
@@ -381,6 +382,8 @@ logic        mem_avec;
 logic        in_exc, in_iack;
 
 logic        trace_t1, trace_t0, flow, stop_pending;
+logic        retire_q, first_fetch;
+assign END_ST = (trace_t1 || trace_t0) ? S_END : S_FETCH;
 
 // exceptions
 logic [7:0]  exc_vec;
@@ -427,7 +430,8 @@ wire  [2:0]  bf_bcount = bf_bsum[5:3];
 // interrupts
 logic [2:0]  ipl_q;
 logic        nmi_prev, nmi_latch;
-wire         int_pending = (ipl_q == 3'd7) ? (nmi_latch || sr[10:8] != 3'd7) : (ipl_q > sr[10:8]);
+wire         nmi_pend    = nmi_latch || (ipl_q == 3'd7 && !nmi_prev);      // level 7 is edge triggered
+wire         int_pending = (ipl_q == 3'd7) ? (nmi_pend || sr[10:8] != 3'd7) : (ipl_q > sr[10:8]);
 
 // -----------------------------------------------------------------------------
 // register file: D0-D7 = 0..7, A0-A6 = 8..14, USP 15, ISP 16, MSP 17
@@ -450,10 +454,23 @@ function automatic [4:0] ph(input [3:0] l, input [4:0] spp);
 endfunction
 
 logic [4:0]  raA, raB, raC;
-wire  [31:0] rA = {rf_hi[raA],   rf_b1[raA],   rf_b0[raA]};
-wire  [31:0] rB = {rf_hi[raB],   rf_b1[raB],   rf_b0[raB]};
-wire  [31:0] rC = {rf_hi[raC],   rf_b1[raC],   rf_b0[raC]};
-wire  [31:0] sp = {rf_hi[sp_ph], rf_b1[sp_ph], rf_b0[sp_ph]};
+// registered write request (applied one clock later) + per-lane bypass
+logic        wq_en;
+logic [4:0]  wq_a;
+logic [31:0] wq_d;
+logic [1:0]  wq_sz;
+function automatic [31:0] rfrd(input [4:0] a, input [7:0] b0, input [7:0] b1, input [15:0] hi,
+                               input en, input [4:0] wa, input [31:0] wd, input [1:0] wsz);
+    logic hit;
+    hit = en && (wa == a);
+    rfrd = { (hit && wsz == SZ_L) ? wd[31:16] : hi,
+             (hit && wsz != SZ_B) ? wd[15:8]  : b1,
+             hit                  ? wd[7:0]   : b0 };
+endfunction
+wire  [31:0] rA = rfrd(raA,   rf_b0[raA],   rf_b1[raA],   rf_hi[raA],   wq_en, wq_a, wq_d, wq_sz);
+wire  [31:0] rB = rfrd(raB,   rf_b0[raB],   rf_b1[raB],   rf_hi[raB],   wq_en, wq_a, wq_d, wq_sz);
+wire  [31:0] rC = rfrd(raC,   rf_b0[raC],   rf_b1[raC],   rf_hi[raC],   wq_en, wq_a, wq_d, wq_sz);
+wire  [31:0] sp = rfrd(sp_ph, rf_b0[sp_ph], rf_b1[sp_ph], rf_hi[sp_ph], wq_en, wq_a, wq_d, wq_sz);
 
 // -----------------------------------------------------------------------------
 // instruction prefetch buffer + instruction cache
@@ -520,6 +537,13 @@ end
 `define ILLEGAL   `EXC(8'd4, 4'h0, PCi, PCi)
 `define PRIV      `EXC(8'd8, 4'h0, PCi, PCi)
 
+// source operand done: a register destination is read right away (port B)
+`define SRC_DONE begin \
+    if (g_after_src == G_DST && (g_dsel != 2'd0 || dst_mode[2:1] == 2'b00)) begin \
+        dst <= rB; dst_kind <= (g_dsel == 2'd2 || (g_dsel == 2'd0 && dst_mode[0])) ? K_A : K_D; \
+        dst_rn <= dst_reg; state <= g_after_dst; \
+    end else state <= g_after_src; end
+
 // call EA engine
 `define CALL_EA(M, Rg, S, RET) begin \
     ea_mode <= (M); ea_reg <= (Rg); ea_sz <= (S); ea_ret <= (RET); state <= E_START; end
@@ -535,6 +559,9 @@ wire [2:0]  ir_x   = IR[11:9];
 // EA increment for (An)+ / -(An)
 wire [31:0] ea_inc = (ea_sz == SZ_B) ? ((ea_reg == 3'd7) ? 32'd2 : 32'd1) :
                      (ea_sz == SZ_W) ? 32'd2 : 32'd4;
+wire [31:0] ea_dec = rA - ea_inc;                                  // port A = An in E_START
+wire [31:0] ea_ind = (ea_mode == 3'd4) ? ea_dec : rA;              // operand address
+wire [31:0] ea_upd = (ea_mode == 3'd4) ? ea_dec : rA + ea_inc;     // new An
 
 // index register (port B in E_IDX)
 wire [31:0] idx_val = (iw[11] ? rB : sx16(rB[15:0])) << iw[10:9];
@@ -545,6 +572,11 @@ wire [37:0] alu_o = alu(aop, sz, alu_s, dst, sr[4:0], cond(IR[11:8], sr[4:0]));
 wire        alu_z = alu_o[34];
 wire        alu_n = alu_o[35];
 wire        alu_v = alu_o[33];
+// registered ALU output, for states that branch on a comparison result
+logic [37:0] alu_q;
+wire        aq_z = alu_q[34];
+wire        aq_n = alu_q[35];
+wire        aq_v = alu_q[33];
 
 // register shift count (decode, port A = D[ir_x])
 wire [5:0]  sh_cnt_dec = IR[5] ? rA[5:0] : (IR[11:9] == 3'd0 ? 6'd8 : {3'd0, IR[11:9]});
@@ -605,8 +637,12 @@ always_comb begin
                 3'd1: md_y = {32'd0, mul_p};
                 3'd2, 3'd3: md_y = {16'd0, mul_p, 16'd0};
                 3'd4: md_y = {mul_p, 32'd0};
-                3'd5: if (md_signed && md_a[31]) begin md_y = {~md_b, 32'hFFFF_FFFF}; md_cin = 1'b1; end
-                3'd6: if (md_signed && md_b[31]) begin md_y = {~md_a, 32'hFFFF_FFFF}; md_cin = 1'b1; end
+                // signed corrections: 32-bit form subtracts b<<32 / a<<32,
+                // 16-bit form (MULS.W, zero-extended operands) subtracts b<<16 / a<<16
+                3'd5: if (md_signed && (md_word ? md_a[15] : md_a[31])) begin
+                          md_y = md_word ? ~{32'd0, md_b[15:0], 16'd0} : {~md_b, 32'hFFFF_FFFF}; md_cin = 1'b1; end
+                3'd6: if (md_signed && (md_word ? md_b[15] : md_b[31])) begin
+                          md_y = md_word ? ~{32'd0, md_a[15:0], 16'd0} : {~md_a, 32'hFFFF_FFFF}; md_cin = 1'b1; end
                 default: ;
             endcase
         end
@@ -639,8 +675,17 @@ always_comb begin
         end
         E_START:                 raA = ph({1'b1, ea_reg}, sp_ph);
         E_IDX:                   raB = ph(iw[15:12], sp_ph);
-        G_SRC_RD, G_DST_RD:      raA = ph({ea_kind == K_A, ea_reg}, sp_ph);
-        G_DST:                   raA = ph({g_dsel == 2'd2, dst_reg}, sp_ph);
+        G_SRC_RD, G_SRC_RD2, E_IMM1, E_IMM2: begin
+            raA = ph({ea_kind == K_A, ea_reg}, sp_ph);
+            raB = (g_dsel == 2'd0) ? ph({dst_mode[0], dst_reg}, sp_ph) : ph({g_dsel == 2'd2, dst_reg}, sp_ph);
+        end
+        G_DST_RD:                raA = ph({ea_kind == K_A, ea_reg}, sp_ph);
+        G_SRC: begin
+            raA = ph({src_mode[0], src_reg}, sp_ph);
+            raB = (g_dsel == 2'd0) ? ph({dst_mode[0], dst_reg}, sp_ph) : ph({g_dsel == 2'd2, dst_reg}, sp_ph);
+        end
+        G_DST:                   raA = (g_dsel == 2'd0) ? ph({dst_mode[0], dst_reg}, sp_ph)
+                                                        : ph({g_dsel == 2'd2, dst_reg}, sp_ph);
         S_MOVEM0, S_MOVEP0, S_LINK1: raA = ph({1'b1, ir_r}, sp_ph);
         S_MOVEM_L:               raA = ph(lsb16(mvm_mask), sp_ph);
         S_MOVEM_PD:              raA = ph(4'd15 - lsb16(mvm_mask), sp_ph);
@@ -700,8 +745,8 @@ wire [31:0] bus_addr_end = bus_addr + ((bus_size == SZ_L) ? 32'd3 : (bus_size ==
 // -----------------------------------------------------------------------------
 // debug outputs (shadow copy of the register file)
 // -----------------------------------------------------------------------------
-assign dbg_retire = (state == S_RETIRE) && ce;
-assign dbg_pc  = PC;
+assign dbg_retire = retire_q && ce;      // pulse in the cycle after the next opcode was fetched
+assign dbg_pc  = PCi;                    // = address of that next instruction
 assign dbg_sr  = sr;
 assign dbg_vbr = vbr;
 assign halted  = (state == S_HALT);
@@ -738,6 +783,9 @@ always_ff @(posedge clk) if (ce) begin
     nmi_prev <= (ipl_q == 3'd7);
     if (ipl_q == 3'd7 && !nmi_prev) nmi_latch <= 1'b1;
 
+    alu_q <= alu_o;
+    retire_q <= 1'b0;
+
     if (!rst_n) begin
         state     <= S_CLR;
         cnt6      <= 6'd0;
@@ -763,6 +811,7 @@ always_ff @(posedge clk) if (ce) begin
         trace_t0  <= 1'b0;
         nmi_latch <= 1'b0;
         stop_pending <= 1'b0;
+        first_fetch <= 1'b1;
     end else begin
     case (state)
 
@@ -843,7 +892,11 @@ always_ff @(posedge clk) if (ce) begin
     // instruction fetch / completion
     // =========================================================================
     S_FETCH: begin
-        if (int_pending) begin
+        bus_lock <= 1'b0;
+        if (stop_pending) begin
+            stop_pending <= 1'b0;
+            state <= S_STOPPED;
+        end else if (int_pending) begin
             state <= S_INT0;
         end else if (PC[0]) begin
             x_ssw <= 16'h4006 | {13'd0, sr[13], 2'b10};
@@ -859,26 +912,24 @@ always_ff @(posedge clk) if (ce) begin
             trace_t0 <= sr[14];
             flow     <= 1'b0;
             state    <= S_DECODE;
+            // the previous instruction (and any exception / interrupt taken after it)
+            // is complete: its register writes are visible from the next cycle on
+            retire_q    <= !first_fetch;
+            first_fetch <= 1'b0;
         end
     end
 
     S_END: begin
-        bus_lock <= 1'b0;
+        // only reached when tracing: take the trace exception, then fetch
         if (trace_t1 || (trace_t0 && flow)) begin
             trace_t1 <= 1'b0;
             trace_t0 <= 1'b0;
             `EXCT(8'd9, 4'h2, PC, PCi)
         end else begin
-            state <= S_RETIRE;
-        end
-    end
-
-    S_RETIRE: begin
-        if (stop_pending) begin
-            stop_pending <= 1'b0;
-            state <= S_STOPPED;
-        end else
+            trace_t1 <= 1'b0;
+            trace_t0 <= 1'b0;
             state <= S_FETCH;
+        end
     end
 
     S_STOPPED: begin
@@ -894,9 +945,20 @@ always_ff @(posedge clk) if (ce) begin
         case (ea_mode)
             3'd0: begin ea_kind <= K_D; state <= ea_ret; end
             3'd1: begin ea_kind <= K_A; state <= ea_ret; end
-            3'd2: begin ea_kind <= K_M; ea_addr <= rA; state <= ea_ret; end
-            3'd3: begin ea_kind <= K_M; ea_addr <= rA; `WR_A(ea_reg, rA + ea_inc) state <= ea_ret; end
-            3'd4: begin ea_kind <= K_M; ea_addr <= rA - ea_inc; `WR_A(ea_reg, rA - ea_inc) state <= ea_ret; end
+            3'd2, 3'd3, 3'd4: begin
+                ea_kind <= K_M;
+                ea_addr <= ea_ind;
+                if (ea_mode != 3'd2) `WR_A(ea_reg, ea_upd)
+                // generic flow: issue the operand read right away
+                if (ea_ret == G_SRC_RD)
+                    `MEMRD(ea_ind, ssz, G_SRC_RD2)
+                else if (ea_ret == G_DST_RD) begin
+                    dst_kind <= K_M; dst_addr <= ea_ind; dst_rn <= ea_reg;
+                    if (g_rd) `MEMRD(ea_ind, sz, G_DST_RD2)
+                    else      state <= g_after_dst;
+                end else
+                    state <= ea_ret;
+            end
             3'd5: begin ea_base <= rA; state <= E_D16; end
             3'd6: begin ea_base <= rA; state <= E_IDX; end
             default: case (ea_reg)
@@ -943,13 +1005,25 @@ always_ff @(posedge clk) if (ce) begin
             if (ea_sz == SZ_L) begin ea_imm[31:16] <= iw; state <= E_IMM2; end
             else begin
                 ea_imm <= (ea_sz == SZ_B) ? {24'd0, iw[7:0]} : {16'd0, iw};
-                state <= ea_ret;
+                if (ea_ret == G_SRC_RD) begin
+                    src <= (ea_sz == SZ_B) ? {24'd0, iw[7:0]} : {16'd0, iw};
+                    `SRC_DONE
+                end else
+                    state <= ea_ret;
             end
         end
     end
     E_IMM2: begin
         if (!iw_hit) `NEED_IW(E_IMM2)
-        else begin PC <= PC + 32'd2; ea_imm[15:0] <= iw; state <= ea_ret; end
+        else begin
+            PC <= PC + 32'd2;
+            ea_imm[15:0] <= iw;
+            if (ea_ret == G_SRC_RD) begin
+                src <= {ea_imm[31:16], iw};
+                `SRC_DONE
+            end else
+                state <= ea_ret;
+        end
     end
     E_IDX: begin
         if (!iw_hit) `NEED_IW(E_IDX)
@@ -1026,23 +1100,29 @@ always_ff @(posedge clk) if (ce) begin
     // generic ALU flow:  [src EA read] -> [dst EA (read)] -> exec -> [write]
     // =========================================================================
     G_SRC: begin
-        if (g_src_ea) `CALL_EA(src_mode, src_reg, ssz, G_SRC_RD)
+        if (g_src_ea && src_mode[2:1] == 2'b00) begin
+            // register source (port A); a register destination is read in the same cycle (port B)
+            src <= rA;
+            `SRC_DONE
+        end else if (g_src_ea) `CALL_EA(src_mode, src_reg, ssz, G_SRC_RD)
         else state <= g_after_src;
     end
     G_SRC_RD: begin
         case (ea_kind)
-            K_D, K_A: begin src <= rA; state <= g_after_src; end
-            K_I:      begin src <= ea_imm; state <= g_after_src; end
+            K_D, K_A: begin src <= rA; `SRC_DONE end
+            K_I:      begin src <= ea_imm; `SRC_DONE end
             default:  `MEMRD(ea_addr, ssz, G_SRC_RD2)
         endcase
     end
     G_SRC_RD2: begin
         src <= mem_rd;
-        state <= g_after_src;
+        `SRC_DONE
     end
     G_DST: begin
         case (g_dsel)
-            2'd0: `CALL_EA(dst_mode, dst_reg, sz, G_DST_RD)
+            2'd0: if (dst_mode[2:1] == 2'b00) begin       // register destination: read directly
+                      dst <= rA; dst_kind <= dst_mode[0] ? K_A : K_D; dst_rn <= dst_reg; state <= g_after_dst;
+                  end else `CALL_EA(dst_mode, dst_reg, sz, G_DST_RD)
             2'd1: begin dst <= rA; dst_kind <= K_D; dst_rn <= dst_reg; state <= g_after_dst; end
             default: begin dst <= rA; dst_kind <= K_A; dst_rn <= dst_reg; state <= g_after_dst; end
         endcase
@@ -1070,13 +1150,22 @@ always_ff @(posedge clk) if (ce) begin
             A_TOSR:  sr <= src[15:0] & SR_MASK;
             default: ;
         endcase
-        state <= g_wr ? G_WB : S_END;
+        if (g_wr && dst_kind == K_D) begin           // register result: write it now
+            `WR_D(dst_rn, alu_o[31:0], sz)
+            state <= END_ST;
+        end else if (g_wr && dst_kind == K_A) begin
+            `WR_A(dst_rn, alu_o[31:0])
+            state <= END_ST;
+        end else if (g_wr && aop != A_TOSR && aop != A_TOCCR)
+            `MEMWR(dst_addr, sz, alu_o[31:0], END_ST)
+        else
+            state <= END_ST;
     end
     G_WB: begin
         case (dst_kind)
-            K_D: begin `WR_D(dst_rn, res, sz) state <= S_END; end
-            K_A: begin `WR_A(dst_rn, res) state <= S_END; end
-            default: `MEMWR(dst_addr, sz, res, S_END)
+            K_D: begin `WR_D(dst_rn, res, sz) state <= END_ST; end
+            K_A: begin `WR_A(dst_rn, res) state <= END_ST; end
+            default: `MEMWR(dst_addr, sz, res, END_ST)
         endcase
     end
 
@@ -1166,8 +1255,8 @@ always_ff @(posedge clk) if (ce) begin
             end
         end
         16'b0000_1110_????_????: begin                             // MOVES
-            if (!sr[13]) `PRIV
-            else if (ir_sz == 2'b11 || !eaok(ir_m, ir_r, M_MALT)) `ILLEGAL
+            if (ir_sz == 2'b11 || !eaok(ir_m, ir_r, M_MALT)) `ILLEGAL
+            else if (!sr[13]) `PRIV
             else state <= S_MOVESX;
         end
 
@@ -1198,7 +1287,7 @@ always_ff @(posedge clk) if (ce) begin
         16'h4E70: begin                                            // RESET
             if (!sr[13]) `PRIV else begin reset_cnt <= 32'd0; state <= S_RESETI; end
         end
-        16'h4E71: state <= S_END;                                  // NOP
+        16'h4E71: state <= END_ST;                                  // NOP
         16'h4E72: begin                                            // STOP
             if (!sr[13]) `PRIV else state <= S_STOP0;
         end
@@ -1211,7 +1300,7 @@ always_ff @(posedge clk) if (ce) begin
         end
         16'h4E76: begin                                            // TRAPV
             if (sr[1]) `EXCT(8'd7, 4'h2, PC, PCi)
-            else state <= S_END;
+            else state <= END_ST;
         end
         16'h4E77: begin                                            // RTR
             `MEMRD(sp, SZ_W, S_RTR1)
@@ -1233,7 +1322,7 @@ always_ff @(posedge clk) if (ce) begin
             else begin
                 if (IR[3]) `WR_A(ir_r, rC)
                 else       `RFW(P_USP, rB, SZ_L)
-                state <= S_END;
+                state <= END_ST;
             end
         end
         16'b0100_1110_10??_????: begin                             // JSR
@@ -1249,7 +1338,7 @@ always_ff @(posedge clk) if (ce) begin
             sr[3] <= rB[15];
             sr[2] <= (rB == 32'd0);
             sr[1:0] <= 2'b00;
-            state <= S_END;
+            state <= END_ST;
         end
         16'b0100_1000_0100_1???: `ILLEGAL                          // BKPT (no debugger)
         16'b0100_1000_1000_0???: begin                             // EXT.W
@@ -1257,21 +1346,21 @@ always_ff @(posedge clk) if (ce) begin
             sr[3] <= rB[7];
             sr[2] <= (rB[7:0] == 8'd0);
             sr[1:0] <= 2'b00;
-            state <= S_END;
+            state <= END_ST;
         end
         16'b0100_1000_1100_0???: begin                             // EXT.L
             `WR_D(ir_r, sx16(rB[15:0]), SZ_L)
             sr[3] <= rB[15];
             sr[2] <= (rB[15:0] == 16'd0);
             sr[1:0] <= 2'b00;
-            state <= S_END;
+            state <= END_ST;
         end
         16'b0100_1001_1100_0???: begin                             // EXTB.L
             `WR_D(ir_r, sx8(rB[7:0]), SZ_L)
             sr[3] <= rB[7];
             sr[2] <= (rB[7:0] == 8'd0);
             sr[1:0] <= 2'b00;
-            state <= S_END;
+            state <= END_ST;
         end
         16'b0100_1000_00??_????: begin                             // NBCD
             if (!eaok(ir_m, ir_r, M_DALT)) `ILLEGAL
@@ -1286,8 +1375,8 @@ always_ff @(posedge clk) if (ce) begin
             else begin sz <= IR[6] ? SZ_L : SZ_W; state <= S_MOVEM0; end
         end
         16'b0100_0000_11??_????: begin                             // MOVE from SR
-            if (!sr[13]) `PRIV
-            else if (!eaok(ir_m, ir_r, M_DALT)) `ILLEGAL
+            if (!eaok(ir_m, ir_r, M_DALT)) `ILLEGAL
+            else if (!sr[13]) `PRIV
             else begin sz <= SZ_W; g_src_ea <= 1'b0; src <= {16'd0, sr}; aop <= A_FROMSR; g_rd <= 1'b0; state <= G_DST; end
         end
         16'b0100_0010_11??_????: begin                             // MOVE from CCR
@@ -1299,8 +1388,8 @@ always_ff @(posedge clk) if (ce) begin
             else begin ssz <= SZ_W; sz <= SZ_W; aop <= A_TOCCR; g_after_src <= G_EXEC; g_wr <= 1'b0; state <= G_SRC; end
         end
         16'b0100_0110_11??_????: begin                             // MOVE to SR
-            if (!sr[13]) `PRIV
-            else if (!eaok(ir_m, ir_r, M_DATA)) `ILLEGAL
+            if (!eaok(ir_m, ir_r, M_DATA)) `ILLEGAL
+            else if (!sr[13]) `PRIV
             else begin ssz <= SZ_W; sz <= SZ_W; aop <= A_TOSR; g_after_src <= G_EXEC; g_wr <= 1'b0; state <= G_SRC; end
         end
         16'b0100_0000_????_????, 16'b0100_0010_????_????,
@@ -1382,7 +1471,7 @@ always_ff @(posedge clk) if (ce) begin
             sr[3] <= IR[7];
             sr[2] <= (IR[7:0] == 8'd0);
             sr[1:0] <= 2'b00;
-            state <= S_END;
+            state <= END_ST;
         end
 
         // -------------------------------------------------------------- line 8
@@ -1507,7 +1596,7 @@ always_ff @(posedge clk) if (ce) begin
 
     S_EXG2: begin
         `RFW(ph({ya_dec, ir_r}, sp_ph), tmp, SZ_L)
-        state <= S_END;
+        state <= END_ST;
     end
 
     // =========================================================================
@@ -1528,7 +1617,7 @@ always_ff @(posedge clk) if (ce) begin
     S_IMMSR2: begin
         if (IR[6]) sr <= tmp[15:0] & SR_MASK;
         else       sr[4:0] <= tmp[4:0];
-        state <= S_END;
+        state <= END_ST;
     end
 
     // =========================================================================
@@ -1557,7 +1646,7 @@ always_ff @(posedge clk) if (ce) begin
     S_MOVEM_L: begin
         if (mvm_mask == 16'd0) begin
             if (ir_m == 3'd3) `WR_A(ir_r, mvm_addr)
-            state <= S_END;
+            state <= END_ST;
         end else begin
             cnt6[3:0] <= lsb16(mvm_mask);
             mvm_mask[lsb16(mvm_mask)] <= 1'b0;
@@ -1573,7 +1662,7 @@ always_ff @(posedge clk) if (ce) begin
     S_MOVEM_PD: begin
         if (mvm_mask == 16'd0) begin
             `WR_A(ir_r, mvm_addr)
-            state <= S_END;
+            state <= END_ST;
         end else begin
             mvm_mask[lsb16(mvm_mask)] <= 1'b0;
             mvm_addr <= mvm_addr - szbytes(sz);
@@ -1610,7 +1699,7 @@ always_ff @(posedge clk) if (ce) begin
     S_MOVEP1: begin
         if (cnt3 == 3'd0) begin
             if (!IR[7]) `WR_D(ir_x, tmp, IR[6] ? SZ_L : SZ_W)
-            state <= S_END;
+            state <= END_ST;
         end else begin
             cnt3 <= cnt3 - 3'd1;
             mvm_addr <= mvm_addr + 32'd2;
@@ -1628,7 +1717,14 @@ always_ff @(posedge clk) if (ce) begin
     S_BCC0: begin
         if (IR[7:0] == 8'h00) state <= S_BCCW;
         else if (IR[7:0] == 8'hFF) state <= S_BCCL1;
-        else begin bdisp <= sx8(IR[7:0]); state <= S_BCCGO; end
+        else if (IR[11:8] == 4'h1) begin bdisp <= sx8(IR[7:0]); state <= S_BCCGO; end   // BSR.S
+        else begin                                                                      // Bcc.S / BRA.S
+            if (cond(IR[11:8], sr[4:0])) begin
+                PC <= PC + sx8(IR[7:0]);       // PC = PCi + 2 here
+                flow <= 1'b1;
+            end
+            state <= END_ST;
+        end
     end
     S_BCCW: begin
         if (!iw_hit) `NEED_IW(S_BCCW)
@@ -1646,13 +1742,13 @@ always_ff @(posedge clk) if (ce) begin
         if (IR[11:8] == 4'h1) begin           // BSR
             PC <= PCi + 32'd2 + bdisp;
             flow <= 1'b1;
-            `PUSHL(PC, S_END)
+            `PUSHL(PC, END_ST)
         end else begin
             if (cond(IR[11:8], sr[4:0])) begin
                 PC <= PCi + 32'd2 + bdisp;
                 flow <= 1'b1;
             end
-            state <= S_END;
+            state <= END_ST;
         end
     end
 
@@ -1670,7 +1766,7 @@ always_ff @(posedge clk) if (ce) begin
                     flow <= 1'b1;
                 end
             end
-            state <= S_END;
+            state <= END_ST;
         end
     end
     S_TRAPCC: begin
@@ -1684,7 +1780,7 @@ always_ff @(posedge clk) if (ce) begin
     end
     S_TRAPCC2: begin
         if (cond(IR[11:8], sr[4:0])) `EXCT(8'd7, 4'h2, PC, PCi)
-        else state <= S_END;
+        else state <= END_ST;
     end
 
     // =========================================================================
@@ -1693,19 +1789,19 @@ always_ff @(posedge clk) if (ce) begin
     S_JEA: begin
         PC <= ea_addr;
         flow <= 1'b1;
-        state <= S_END;
+        state <= END_ST;
     end
     S_JSR2: begin
         PC <= ea_addr;
         flow <= 1'b1;
-        `PUSHL(PC, S_END)
+        `PUSHL(PC, END_ST)
     end
     S_LEA: begin
         `WR_A(ir_x, ea_addr)
-        state <= S_END;
+        state <= END_ST;
     end
     S_PEA: begin
-        `PUSHL(ea_addr, S_END)
+        `PUSHL(ea_addr, END_ST)
     end
 
     // =========================================================================
@@ -1733,12 +1829,12 @@ always_ff @(posedge clk) if (ce) begin
     end
     S_LINK3: begin
         `WR_SP(sp + bdisp)
-        state <= S_END;
+        state <= END_ST;
     end
     S_UNLK1: begin
         if (ir_r == 3'd7) begin
             `WR_SP(mem_rd)
-            state <= S_END;
+            state <= END_ST;
         end else begin
             `WR_A(ir_r, mem_rd)
             state <= S_UNLK2;
@@ -1746,7 +1842,7 @@ always_ff @(posedge clk) if (ce) begin
     end
     S_UNLK2: begin
         `WR_SP(sp + 32'd4)
-        state <= S_END;
+        state <= END_ST;
     end
 
     // =========================================================================
@@ -1756,7 +1852,7 @@ always_ff @(posedge clk) if (ce) begin
         PC <= mem_rd;
         `WR_SP(sp + 32'd4)
         flow <= 1'b1;
-        state <= S_END;
+        state <= END_ST;
     end
     S_RTD0: begin
         if (!iw_hit) `NEED_IW(S_RTD0)
@@ -1770,7 +1866,7 @@ always_ff @(posedge clk) if (ce) begin
         PC <= mem_rd;
         `WR_SP(sp + 32'd4 + bdisp)
         flow <= 1'b1;
-        state <= S_END;
+        state <= END_ST;
     end
     S_RTR1: begin
         sr[4:0] <= mem_rd[4:0];
@@ -1780,7 +1876,7 @@ always_ff @(posedge clk) if (ce) begin
         PC <= mem_rd;
         `WR_SP(sp + 32'd6)
         flow <= 1'b1;
-        state <= S_END;
+        state <= END_ST;
     end
 
     // =========================================================================
@@ -1814,7 +1910,7 @@ always_ff @(posedge clk) if (ce) begin
         else begin
             PC <= tmp;
             flow <= 1'b1;
-            state <= S_END;
+            state <= END_ST;
         end
     end
 
@@ -1827,8 +1923,9 @@ always_ff @(posedge clk) if (ce) begin
         sz   <= SZ_L;
         aop  <= A_CMP;
         sext_src <= 1'b0;
-        state <= S_CHK1;
+        state <= S_CHK1W;
     end
+    S_CHK1W: state <= S_CHK1;                      // compare result -> alu_q
     S_CHK1: begin
         // dst = Dn, src = bound (both sign-extended): Dn > bound  <=>  GT
         sr[2] <= (dst == 32'd0);
@@ -1836,11 +1933,11 @@ always_ff @(posedge clk) if (ce) begin
         if (dst[31]) begin
             sr[3] <= 1'b1;
             `EXCT(8'd6, 4'h2, PC, PCi)
-        end else if (!alu_z && (alu_n == alu_v)) begin
+        end else if (!aq_z && (aq_n == aq_v)) begin
             sr[3] <= 1'b0;
             `EXCT(8'd6, 4'h2, PC, PCi)
         end else
-            state <= S_END;
+            state <= END_ST;
     end
 
     // =========================================================================
@@ -1882,14 +1979,15 @@ always_ff @(posedge clk) if (ce) begin
         src <= tmp;                                // compare 3: rv - upper
         state <= S_CHK2C3;
     end
-    S_CHK2C3: begin : chk2_blk
+    S_CHK2C3: state <= S_CHK2C4;                   // compare 3 -> alu_q
+    S_CHK2C4: begin : chk2_blk
         logic gt, out;
-        gt  = !alu_z && (alu_n == alu_v);          // rv > upper
+        gt  = !aq_z && (aq_n == aq_v);             // rv > upper
         out = flg[0] ? (flg[1] || gt) : (flg[1] && gt);
-        if (alu_z) sr[2] <= 1'b1;
+        if (aq_z) sr[2] <= 1'b1;
         sr[0] <= out;
         if (out && ext[11]) `EXCT(8'd6, 4'h2, PC, PCi)
-        else state <= S_END;
+        else state <= END_ST;
     end
 
     // =========================================================================
@@ -1897,8 +1995,8 @@ always_ff @(posedge clk) if (ce) begin
     // =========================================================================
     S_MULW: begin
         md_signed <= IR[8];
-        md_a <= IR[8] ? sx16(src[15:0]) : {16'd0, src[15:0]};
-        md_b <= IR[8] ? sx16(rA[15:0])  : {16'd0, rA[15:0]};
+        md_a <= {16'd0, src[15:0]};
+        md_b <= {16'd0, rA[15:0]};
         md_word <= 1'b1;
         md_long64 <= 1'b0;
         md_acc <= 64'd0;
@@ -1933,8 +2031,9 @@ always_ff @(posedge clk) if (ce) begin
             default: ;
         endcase
         md_acc  <= md_sum;
-        md_step <= md_step + 3'd1;
-        if (md_step == 3'd6) state <= S_MUL_FIN;
+        // 16x16: one partial product (+ two corrections when signed)
+        md_step <= (md_word && md_step == 3'd1) ? 3'd5 : md_step + 3'd1;
+        if (md_step == 3'd6 || (md_word && !md_signed && md_step == 3'd1)) state <= S_MUL_FIN;
     end
     S_MUL_FIN: begin
         if (md_word) begin
@@ -1942,7 +2041,7 @@ always_ff @(posedge clk) if (ce) begin
             sr[3] <= md_acc[31];
             sr[2] <= (md_acc[31:0] == 32'd0);
             sr[1:0] <= 2'b00;
-            state <= S_END;
+            state <= END_ST;
         end else if (md_long64) begin
             `WR_D(ext[2:0], md_acc[63:32], SZ_L)
             sr[3] <= md_acc[63];
@@ -1959,7 +2058,7 @@ always_ff @(posedge clk) if (ce) begin
     end
     S_MUL_FIN2: begin
         `WR_D(ext[14:12], md_acc[31:0], SZ_L)
-        state <= S_END;
+        state <= END_ST;
     end
 
     // =========================================================================
@@ -2023,7 +2122,7 @@ always_ff @(posedge clk) if (ce) begin
             // overflow pre-check: high half must be < divisor
             if (!div_diff[33]) begin
                 sr[1] <= 1'b1; sr[0] <= 1'b0;
-                state <= S_END;
+                state <= END_ST;
             end else begin
                 md_rem <= {1'b0, md_acc[63:32]};
                 md_q   <= md_acc[31:0];
@@ -2051,7 +2150,7 @@ always_ff @(posedge clk) if (ce) begin
         tmp <= md_sum[31:0];                       // signed remainder
         if (ovf) begin
             sr[1] <= 1'b1;
-            state <= S_END;
+            state <= END_ST;
         end else begin
             sr[1] <= 1'b0;
             if (!md_word && (md_long64 || ext[2:0] != ext[14:12]))
@@ -2069,7 +2168,7 @@ always_ff @(posedge clk) if (ce) begin
             sr[3] <= md_sum[31];
             sr[2] <= (md_sum[31:0] == 32'd0);
         end
-        state <= S_END;
+        state <= END_ST;
     end
 
     // =========================================================================
@@ -2089,7 +2188,7 @@ always_ff @(posedge clk) if (ce) begin
         end else begin
             `WR_D(ir_r, sh_o[31:0], ir_sz)
             sr[4:0] <= sh_o[36:32];
-            state <= S_END;
+            state <= END_ST;
         end
     end
     S_ROX: begin
@@ -2099,7 +2198,7 @@ always_ff @(posedge clk) if (ce) begin
             sr[2] <= (zxs(tmp, sz) == 32'd0);
             sr[1] <= 1'b0;
             sr[0] <= sr[4];
-            state <= S_END;
+            state <= END_ST;
         end else begin
             cnt6 <= cnt6 - 6'd1;
             if (IR[8]) begin   // left
@@ -2162,7 +2261,7 @@ always_ff @(posedge clk) if (ce) begin
             2'b11: res <= dst | m;
             default: res <= dst;
         endcase
-        state <= (IR[7:6] == 2'b00) ? S_END : G_WB;
+        state <= (IR[7:6] == 2'b00) ? END_ST : G_WB;
     end
 
     // =========================================================================
@@ -2225,21 +2324,21 @@ always_ff @(posedge clk) if (ce) begin
         end
         bf_buf <= bf_nb;
         bf_fr  <= bf_fld;
-        if (!bf_modify) state <= (IR[10:8] == 3'b000) ? S_END : S_BF6;
+        if (!bf_modify) state <= (IR[10:8] == 3'b000) ? END_ST : S_BF6;
         else if (bf_reg) state <= S_BF5;
         else begin
             case (bf_bc)
-                3'd1:       `MEMWR(bf_addr, SZ_B, {24'd0, bf_nb[39:32]}, S_END)
-                3'd2:       `MEMWR(bf_addr, SZ_W, {16'd0, bf_nb[39:24]}, S_END)
+                3'd1:       `MEMWR(bf_addr, SZ_B, {24'd0, bf_nb[39:32]}, END_ST)
+                3'd2:       `MEMWR(bf_addr, SZ_W, {16'd0, bf_nb[39:24]}, END_ST)
                 3'd3:       `MEMWR(bf_addr, SZ_W, {16'd0, bf_nb[39:24]}, S_BF4)
-                3'd4:       `MEMWR(bf_addr, SZ_L, bf_nb[39:8], S_END)
+                3'd4:       `MEMWR(bf_addr, SZ_L, bf_nb[39:8], END_ST)
                 default:    `MEMWR(bf_addr, SZ_L, bf_nb[39:8], S_BF4)
             endcase
         end
     end
     S_BF4: begin
-        if (bf_bc == 3'd3) `MEMWR(bf_addr + 32'd2, SZ_B, {24'd0, bf_buf[23:16]}, S_END)
-        else               `MEMWR(bf_addr + 32'd4, SZ_B, {24'd0, bf_buf[7:0]}, S_END)
+        if (bf_bc == 3'd3) `MEMWR(bf_addr + 32'd2, SZ_B, {24'd0, bf_buf[23:16]}, END_ST)
+        else               `MEMWR(bf_addr + 32'd4, SZ_B, {24'd0, bf_buf[7:0]}, END_ST)
     end
     S_BF6: begin
         // BFEXTU / BFEXTS / BFFFO result from the registered field
@@ -2247,12 +2346,12 @@ always_ff @(posedge clk) if (ce) begin
             `WR_D(ext[14:12], (bf_reg ? {27'd0, bf_off[4:0]} : bf_off) + {26'd0, bf_ffo}, SZ_L)
         else
             `WR_D(ext[14:12], bf_extv[31:0], SZ_L)
-        state <= S_END;
+        state <= END_ST;
     end
     S_BF5: begin
         // register: rotate back (shifter: ROR field, offset)
         `WR_D(ir_r, sh_o[31:0], SZ_L)
-        state <= S_END;
+        state <= END_ST;
     end
 
     // =========================================================================
@@ -2275,14 +2374,15 @@ always_ff @(posedge clk) if (ce) begin
         src <= rA;                                   // Dc
         aop <= A_CMP;
         sext_src <= 1'b0;
-        state <= S_CAS1;
+        state <= S_CAS1W;
     end
+    S_CAS1W: state <= S_CAS1;                      // compare result -> alu_q
     S_CAS1: begin
-        sr[4:0] <= alu_o[36:32];
-        if (alu_z) `MEMWR(ea_addr, sz, rB, S_END)    // Du
+        sr[4:0] <= alu_q[36:32];
+        if (aq_z) `MEMWR(ea_addr, sz, rB, END_ST)     // Du
         else begin
             `WR_D(ext[2:0], dst, sz)
-            state <= S_END;
+            state <= END_ST;
         end
     end
     S_CAS2X1: begin
@@ -2310,26 +2410,28 @@ always_ff @(posedge clk) if (ce) begin
     S_CAS2C1: begin
         src <= rA;                                   // Dc1
         dst <= tmp;
-        state <= S_CAS2C2;
+        state <= S_CAS2C1W;
     end
+    S_CAS2C1W: state <= S_CAS2C2;                  // compare 1 -> alu_q
     S_CAS2C2: begin
-        sr[4:0] <= alu_o[36:32];
-        if (!alu_z) state <= S_CAS2F1;
+        sr[4:0] <= alu_q[36:32];
+        if (!aq_z) state <= S_CAS2F1;
         else begin
             src <= rB;                               // Dc2
             dst <= tmp2;
-            state <= S_CAS2C3;
+            state <= S_CAS2C2W;
         end
     end
+    S_CAS2C2W: state <= S_CAS2C3;                  // compare 2 -> alu_q
     S_CAS2C3: begin
-        sr[4:0] <= alu_o[36:32];
-        state <= alu_z ? S_CAS2W1 : S_CAS2F1;
+        sr[4:0] <= alu_q[36:32];
+        state <= aq_z ? S_CAS2W1 : S_CAS2F1;
     end
     S_CAS2W1: begin
         `MEMWR(rA, sz, rB, S_CAS2W2)                 // Du1 -> (Rn1)
     end
     S_CAS2W2: begin
-        `MEMWR(rA, sz, rB, S_END)                    // Du2 -> (Rn2)
+        `MEMWR(rA, sz, rB, END_ST)                    // Du2 -> (Rn2)
     end
     S_CAS2F1: begin
         `WR_D(ext2[2:0], tmp2, sz)
@@ -2337,7 +2439,7 @@ always_ff @(posedge clk) if (ce) begin
     end
     S_CAS2F2: begin
         `WR_D(ext[2:0], tmp, sz)                     // Dc1 wins if Dc1 == Dc2
-        state <= S_END;
+        state <= END_ST;
     end
 
     // =========================================================================
@@ -2351,7 +2453,7 @@ always_ff @(posedge clk) if (ce) begin
             if (!IR[3]) begin
                 if (!IR[7]) `WR_D(ir_x, {24'd0, pack_b(rA[15:0] + iw)}, SZ_B)                          // PACK Dx,Dy
                 else        `WR_D(ir_x, {16'd0, {4'd0, rA[7:4], 4'd0, rA[3:0]} + iw}, SZ_W)            // UNPK Dx,Dy
-                state <= S_END;
+                state <= END_ST;
             end else begin
                 `CALL_EA(3'd4, ir_r, SZ_B, IR[7] ? S_UNPKM1 : S_PACKM1)
             end
@@ -2393,7 +2495,7 @@ always_ff @(posedge clk) if (ce) begin
             `MEMWR(ea_addr, SZ_B, {24'd0, tmp2[7:0]}, S_UNPKM4)
         end else begin
             cnt3 <= 3'd0;
-            `MEMWR(ea_addr, SZ_B, {24'd0, tmp2[15:8]}, S_END)
+            `MEMWR(ea_addr, SZ_B, {24'd0, tmp2[15:8]}, END_ST)
         end
     end
     S_UNPKM4: begin
@@ -2407,7 +2509,7 @@ always_ff @(posedge clk) if (ce) begin
         if (!iw_hit) `NEED_IW(S_MOVECX)
         else begin
             PC <= PC + 32'd2;
-            state <= S_END;
+            state <= END_ST;
             if (IR[0]) begin
                 // Rn -> Rc  (port A = Rn)
                 case (iw[11:0])
@@ -2444,13 +2546,13 @@ always_ff @(posedge clk) if (ce) begin
         end
     end
     S_MOVESE: begin
-        if (ext[11]) `MEMX(ea_addr, sz, 1'b1, rA, dfc, S_END)   // 68020 stores post-EA An
+        if (ext[11]) `MEMX(ea_addr, sz, 1'b1, rA, dfc, END_ST)   // 68020 stores post-EA An
         else         `MEMX(ea_addr, sz, 1'b0, 32'd0, sfc, S_MOVES1)
     end
     S_MOVES1: begin
         if (ext[15]) `WR_R(ext[15:12], sxs(mem_rd, sz))
         else         `WR_D(ext[14:12], mem_rd, sz)
-        state <= S_END;
+        state <= END_ST;
     end
 
     // =========================================================================
@@ -2462,7 +2564,7 @@ always_ff @(posedge clk) if (ce) begin
             PC <= PC + 32'd2;
             sr <= iw & SR_MASK;
             stop_pending <= 1'b1;
-            state <= S_END;
+            state <= END_ST;
         end
     end
     S_RESETI: begin
@@ -2470,7 +2572,7 @@ always_ff @(posedge clk) if (ce) begin
         reset_cnt <= reset_cnt + 32'd1;
         if (reset_cnt == RESET_CYCLES) begin
             reset_out <= 1'b0;
-            state <= S_END;
+            state <= END_ST;
         end
     end
 
@@ -2481,6 +2583,7 @@ always_ff @(posedge clk) if (ce) begin
         exc_lvl  <= ipl_q;
         in_iack  <= 1'b1;
         if (ipl_q == 3'd7) nmi_latch <= 1'b0;
+        stop_pending <= 1'b0;                    // an interrupt ends STOP
         PCi      <= PC;
         trace_t1 <= 1'b0;
         trace_t0 <= 1'b0;
@@ -2555,12 +2658,13 @@ always_ff @(posedge clk) if (ce) begin
     endcase
     end
 
-    // register file write (one port, byte-lane enables)
-    if (w_en) begin
-        rf_b0[w_a] <= w_d[7:0];
-        if (w_sz != SZ_B) rf_b1[w_a] <= w_d[15:8];
-        if (w_sz == SZ_L) rf_hi[w_a] <= w_d[31:16];
-        if (DEBUG) shadow[w_a] <= merge(shadow[w_a], w_d, w_sz);
+    // register file write: request registered here, written on the next clock
+    wq_en <= w_en; wq_a <= w_a; wq_d <= w_d; wq_sz <= w_sz;
+    if (wq_en) begin
+        rf_b0[wq_a] <= wq_d[7:0];
+        if (wq_sz != SZ_B) rf_b1[wq_a] <= wq_d[15:8];
+        if (wq_sz == SZ_L) rf_hi[wq_a] <= wq_d[31:16];
+        if (DEBUG) shadow[wq_a] <= merge(shadow[wq_a], wq_d, wq_sz);
     end
 end
 

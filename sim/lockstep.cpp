@@ -89,7 +89,13 @@ unsigned int m68k_read_memory_32(unsigned int a) { return mus_mem.rd(a, 4); }
 unsigned int m68k_read_disassembler_8(unsigned int a) { return mus_mem.rd(a, 1); }
 unsigned int m68k_read_disassembler_16(unsigned int a) { return mus_mem.rd(a, 2); }
 unsigned int m68k_read_disassembler_32(unsigned int a) { return mus_mem.rd(a, 4); }
-void m68k_write_memory_8(unsigned int a, unsigned int v) { mus_mem.wr(a, 1, v); mus_log.add(a, 1, v & 0xff); }
+// prog-mode test hook: a byte write to IRQ_PORT sets the IPL level seen by both models
+static const uint32_t IRQ_PORT = 0x00DFF0F0;
+static int irq_level_req = -1;          // set by either model's write, applied by the harness
+void m68k_write_memory_8(unsigned int a, unsigned int v) {
+    if (a == IRQ_PORT) { m68k_set_irq(v & 7); }
+    mus_mem.wr(a, 1, v); mus_log.add(a, 1, v & 0xff);
+}
 void m68k_write_memory_16(unsigned int a, unsigned int v) { mus_mem.wr(a, 2, v); mus_log.add(a, 2, v & 0xffff); }
 void m68k_write_memory_32(unsigned int a, unsigned int v) { mus_mem.wr(a, 4, v); mus_log.add(a, 4, v); }
 }
@@ -208,6 +214,7 @@ struct Rtl {
                 } else if (x_we) {
                     uint32_t v = n == 4 ? x_wdata : (x_wdata & ((1u << (8 * n)) - 1));
                     rtl_mem.wr(x_addr, n, v);
+                    if (x_addr == IRQ_PORT && n == 1) t->ipl = v & 7;
                     rtl_log.add(x_addr, n, v);
                 } else {
                     t->bus_rdata = rtl_mem.rd(x_addr, n);
@@ -651,12 +658,14 @@ static int run_prog(const Opts &o, bool mus_only = false) {
         if (!mus_step()) { printf("musashi stopped at %08x\n", pre.pc); return 1; }
         CpuState m = mus_state();
         std::string why;
+        uint64_t c0 = rtl.cycles;
         bool rok = rtl.step(o.timeout, why);
+        uint64_t dc = rtl.cycles - c0;
         FlagMask fm = undefined_flags(mclass(dis), m, false);
         if (k == 0) fm.live |= 0x1F;  // CCR undefined after reset: tests must start with move #xxxx,sr
         std::string diff = rok ? compare(m, rtl.state(), fm, false) : "  " + why + "\n";
         for (auto &e : rtl.proto_errs) diff += "  protocol: " + e + "\n";
-        if (o.verbose) printf("%6ld %08x  %s\n", k, pre.pc, dis.c_str());
+        if (o.verbose) printf("%6ld %08x %4llu  %s\n", k, pre.pc, (unsigned long long)dc, dis.c_str());
         if (!diff.empty()) {
             printf("FAIL %s at instruction %ld @%08x: %s\n%s before:\n%s musashi after:\n%s", o.file.c_str(), k, pre.pc,
                    dis.c_str(), diff.c_str(), fmt_state(pre).c_str(), fmt_state(m).c_str());

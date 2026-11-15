@@ -18,7 +18,8 @@
 // the vector is taken from D7..D0 (base64 returns 24+level).
 // The core runs on a clock enable: CE_DIV = 2 uses enPhi1 (one core clock per
 // 68000 clock, 42.6 MHz on base64); CE_DIV = 3 / 4 run it at clk/3 or clk/4 for
-// timing closure (constrain the core's flop-to-flop paths as multicycle CE_DIV).
+// timing closure.  Results are handed to the core on core_ce edges only, so all
+// paths into and inside the core are multicycle CE_DIV paths (see doc/integration.md).
 //
 // Copyright (c) 2026 Jason (ITMD).  Licence: see LICENSE in the project root.
 // =============================================================================
@@ -29,7 +30,7 @@
 module m68020_fx68k #(
     parameter bit ICACHE = 1'b1,
     parameter bit DEBUG  = 1'b0,
-    parameter int CE_DIV = 2
+    parameter int CE_DIV = 3
 ) (
     input  wire        clk,
     input  wire        HALTn,
@@ -159,11 +160,22 @@ function automatic [31:0] ralign(input [31:0] b, input [1:0] s);
     ralign = (s == 2'd0) ? {24'd0, b[7:0]} : (s == 2'd1) ? {16'd0, b[15:0]} : b;
 endfunction
 
+// result of the finished transfer, handed to the core only on a core_ce edge so
+// that every path into the core is a clean CE_DIV-cycle (multicycle) path
+reg         r_done, r_berr;
+reg  [31:0] r_data;
+
 always @(posedge clk) begin
-    // the core samples ack/berr on its clock-enable edges: drop them once consumed
-    if (core_ce && (c_ack || c_berr)) begin
-        c_ack  <= 1'b0;
-        c_berr <= 1'b0;
+    if (core_ce) begin
+        if (c_ack || c_berr) begin            // consumed by the core on this edge
+            c_ack  <= 1'b0;
+            c_berr <= 1'b0;
+        end else if (r_done) begin
+            c_ack   <= !r_berr;
+            c_berr  <= r_berr;
+            c_rdata <= r_data;
+            r_done  <= 1'b0;
+        end
     end
 
     if (extReset || pwrUp) begin
@@ -171,7 +183,7 @@ always @(posedge clk) begin
         ASn   <= 1'b1; UDSn <= 1'b1; LDSn <= 1'b1; eRWn <= 1'b1;
         BGn   <= 1'b1;
         {FC2, FC1, FC0} <= 3'b110;
-        c_ack <= 1'b0; c_berr <= 1'b0;
+        c_ack <= 1'b0; c_berr <= 1'b0; r_done <= 1'b0;
     end else begin
         case (bst)
         B_IDLE: if (enPhi1) begin
@@ -179,7 +191,7 @@ always @(posedge clk) begin
             if (br_lo) begin
                 BGn <= 1'b0;
                 bst <= B_GRANT;
-            end else if (c_req && !c_ack && !c_berr && HALTn) begin
+            end else if (c_req && !c_ack && !c_berr && !r_done && HALTn) begin
                 // start a transfer: first part
                 p_addr <= c_addr;
                 p_rem  <= sz_bytes;
@@ -230,11 +242,11 @@ always @(posedge clk) begin
             end
             ASn <= 1'b1; UDSn <= 1'b1; LDSn <= 1'b1;
             if (p_berr || p_rem == (p_word ? 3'd2 : 3'd1)) begin
-                // transfer complete: hand the result to the core
-                if (p_berr) c_berr <= 1'b1;
-                else        c_ack  <= 1'b1;
-                c_rdata <= ralign(p_word ? {p_rbuf[15:0], iEdb}
-                                         : {p_rbuf[23:0], p_addr[0] ? iEdb[7:0] : iEdb[15:8]}, p_size);
+                // transfer complete: queue the result for the core
+                r_done <= 1'b1;
+                r_berr <= p_berr;
+                r_data <= ralign(p_word ? {p_rbuf[15:0], iEdb}
+                                        : {p_rbuf[23:0], p_addr[0] ? iEdb[7:0] : iEdb[15:8]}, p_size);
                 bst <= B_S7;
                 p_rem <= 3'd0;
             end else begin
