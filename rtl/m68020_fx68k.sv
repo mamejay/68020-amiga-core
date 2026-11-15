@@ -90,9 +90,21 @@ reg  [31:0] c_rdata;
 wire        c_reset_out, c_halted;
 
 // core clock enable
+// For CE_DIV >= 3 the enable comes straight from a flop (high when cediv == 0): it fans out to
+// every core flop and is a genuine one-clock path, so no logic in front of it.
 reg  [2:0]  cediv = 3'd0;
-always @(posedge clk) cediv <= (cediv == CE_DIV - 1) ? 3'd0 : cediv + 3'd1;
-wire        core_ce = (CE_DIV == 2) ? enPhi1 : (cediv == 3'd0);
+reg         ce_q  = 1'b0;
+always @(posedge clk) begin
+    cediv <= (cediv == CE_DIV - 1) ? 3'd0 : cediv + 3'd1;
+    ce_q  <= (cediv == CE_DIV - 1);
+end
+wire        core_ce = (CE_DIV == 2) ? enPhi1 : ce_q;
+
+// Everything the core samples changes only on core_ce edges, and everything the bus engine
+// takes from the core is re-registered on core_ce edges, so every path into or out of the
+// core is a CE_DIV-cycle path (see doc/integration.md, timing).
+reg         c_rst_n = 1'b0;
+always @(posedge clk) if (core_ce) c_rst_n <= !(extReset || pwrUp);
 
 reg  [2:0]  ipl_s;
 always @(posedge clk) if (enPhi2) ipl_s <= ~{IPL2n, IPL1n, IPL0n};
@@ -100,7 +112,7 @@ always @(posedge clk) if (enPhi2) ipl_s <= ~{IPL2n, IPL1n, IPL0n};
 m68020_core #(.ICACHE(ICACHE), .DEBUG(DEBUG)) core (
     .clk       (clk),
     .ce        (core_ce),
-    .rst_n     (!(extReset || pwrUp)),
+    .rst_n     (c_rst_n),
     .bus_req   (c_req),
     .bus_we    (c_we),
     .bus_addr  (c_addr),
@@ -126,8 +138,12 @@ m68020_core #(.ICACHE(ICACHE), .DEBUG(DEBUG)) core (
     .dbg_vbr   (dbg_vbr)
 );
 
-assign oRESETn  = ~c_reset_out;
-assign oHALTEDn = ~c_halted;
+// registered on core_ce edges: the board logic feeds HALT back into this wrapper, so an
+// unregistered decode of the core state would make a one-clock loop through the top level
+reg         q_reset_out = 1'b0, q_halted = 1'b0;
+always @(posedge clk) if (core_ce) begin q_reset_out <= c_reset_out; q_halted <= c_halted; end
+assign oRESETn  = ~q_reset_out;
+assign oHALTEDn = ~q_halted;
 
 // -----------------------------------------------------------------------------
 // 68000 bus cycle engine
@@ -145,7 +161,25 @@ reg         p_we;
 reg  [1:0]  p_size;          // original size (for read result alignment)
 reg         p_berr;
 
-wire [2:0]  sz_bytes  = (c_size == 2'd0) ? 3'd1 : (c_size == 2'd1) ? 3'd2 : 3'd4;
+// the core's request, re-registered on core_ce edges. q_req drops on the edge where the core
+// takes the acknowledge, so a finished request is never seen again by the engine.
+reg         q_req, q_we;
+reg  [31:0] q_addr, q_wdata;
+reg  [1:0]  q_size;
+reg  [2:0]  q_fc;
+always @(posedge clk) begin
+    if (core_ce) begin
+        q_req   <= c_req && !(c_ack || c_berr);
+        q_we    <= c_we;
+        q_addr  <= c_addr;
+        q_wdata <= c_wdata;
+        q_size  <= c_size;
+        q_fc    <= c_fc;
+    end
+    if (extReset || pwrUp) q_req <= 1'b0;
+end
+
+wire [2:0]  sz_bytes  = (q_size == 2'd0) ? 3'd1 : (q_size == 2'd1) ? 3'd2 : 3'd4;
 // part type for the current address / remaining count
 wire        nxt_word  = !p_addr[0] && (p_rem >= 3'd2);
 
@@ -191,19 +225,19 @@ always @(posedge clk) begin
             if (br_lo) begin
                 BGn <= 1'b0;
                 bst <= B_GRANT;
-            end else if (c_req && !c_ack && !c_berr && !r_done && HALTn) begin
+            end else if (q_req && !c_ack && !c_berr && !r_done && HALTn) begin
                 // start a transfer: first part
-                p_addr <= c_addr;
+                p_addr <= q_addr;
                 p_rem  <= sz_bytes;
-                p_we   <= c_we;
-                p_size <= c_size;
+                p_we   <= q_we;
+                p_size <= q_size;
                 p_berr <= 1'b0;
-                p_wbuf <= (c_size == 2'd0) ? {c_wdata[7:0], 24'd0} :
-                          (c_size == 2'd1) ? {c_wdata[15:0], 16'd0} : c_wdata;
+                p_wbuf <= (q_size == 2'd0) ? {q_wdata[7:0], 24'd0} :
+                          (q_size == 2'd1) ? {q_wdata[15:0], 16'd0} : q_wdata;
                 p_rbuf <= 32'd0;
-                {FC2, FC1, FC0} <= c_fc;
-                eab  <= c_addr[31:1];
-                p_word <= !c_addr[0] && (sz_bytes >= 3'd2);
+                {FC2, FC1, FC0} <= q_fc;
+                eab  <= q_addr[31:1];
+                p_word <= !q_addr[0] && (sz_bytes >= 3'd2);
                 bst  <= B_S0;
             end
         end

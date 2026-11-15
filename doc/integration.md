@@ -49,19 +49,19 @@ is a CE_DIV-cycle path**. In `fx68k/constraints/base64.fdc`:
 1. Delete the fx68k-specific `set_multicycle_path` and `define_attribute` lines that name
    `cpu.excUnit.*` / `cpu.U_nanoRom_t3.*`. Those cells no longer exist, and each line would
    produce a BN105 warning.
-2. Add (for `CE_DIV = 3`):
+2. Add the three lines from `integration/base64_m68020.fdc` (for `CE_DIV = 3`):
 
 ```tcl
-# m68020 core: all flops are clock-enabled every 3rd clk_12x
 set_multicycle_path -setup 3 -hold 2 -from [get_cells {cpu.core.*}] -to [get_cells {cpu.core.*}]
-set_multicycle_path -setup 3 -hold 2 -from [get_cells {cpu.c_ack* cpu.c_berr* cpu.c_rdata*}] -to [get_cells {cpu.core.*}]
+set_multicycle_path -setup 3 -hold 2 -from [get_cells {cpu.c_ack* cpu.c_berr* cpu.c_rdata* cpu.c_rst_n*}] -to [get_cells {cpu.core.*}]
+set_multicycle_path -setup 3 -hold 2 -from [get_cells {cpu.core.*}] -to [get_cells {cpu.q_*}]
 ```
 
-The fx68k notes warn against a blanket `cpu.*` multicycle. That warning is right for fx68k,
-which has flops that run every clock, but doesn't apply here: everything inside `cpu.core` is
-under `if (ce)`. Paths from the core to the wrapper (`c_req`, `c_addr`, ...) are plain
-flop-to-flop and stay single-cycle. Check `grep -c BN105` = 0 after the build, as the existing
-fdc comments describe.
+The fx68k notes warn against a blanket `cpu.*` multicycle. That warning is right here too: the
+wrapper's 68000 bus engine and the clock enable (`ce_q`) run every clock. Only the registers the
+wrapper writes on core-enable edges (`c_*` into the core; `q_*` for the core's request and its
+RESET/HALTED outputs) are CE_DIV-cycle ends. Check `grep -c BN105` = 0 after the build, as the
+existing fdc comments describe.
 
 ## 4. Resources
 

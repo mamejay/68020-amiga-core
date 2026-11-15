@@ -5,10 +5,16 @@
 # define_attribute that names cpu.excUnit.* or cpu.U_nanoRom_t3.* (fx68k cells
 # that no longer exist -> BN105 warnings).
 #
-# Every flop inside cpu.core is clock-enabled every CE_DIV-th clk_12x, and the
-# wrapper only changes the core's inputs on those enable edges, so all paths
-# into and inside the core are CE_DIV-cycle paths.  Values below are for
-# CE_DIV = 3 (setup 3, hold 2).  For CE_DIV = 4 use -setup 4 -hold 3.
+# Every flop inside cpu.core is clock-enabled every CE_DIV-th clk_12x. The
+# wrapper registers on those same enable edges:
+#   into the core : c_ack, c_berr, c_rdata, c_rst_n
+#   out of it     : q_req, q_we, q_addr, q_wdata, q_size, q_fc (the request, for the
+#                   68000 bus engine) and q_reset_out, q_halted (to the board)
+# so every path between two of those (core <-> core, core -> q_*, c_* -> core)
+# is a CE_DIV-cycle path. Everything else, including the enable itself (ce_q) and
+# ipl_s into the core, is single-cycle and must stay that way.
+# Values below are for CE_DIV = 3 (setup 3, hold 2). For CE_DIV = 4 use -setup 4 -hold 3.
 # ---------------------------------------------------------------------
 set_multicycle_path -setup 3 -hold 2 -from [get_cells {cpu.core.*}] -to [get_cells {cpu.core.*}]
-set_multicycle_path -setup 3 -hold 2 -from [get_cells {cpu.c_ack* cpu.c_berr* cpu.c_rdata*}] -to [get_cells {cpu.core.*}]
+set_multicycle_path -setup 3 -hold 2 -from [get_cells {cpu.c_ack* cpu.c_berr* cpu.c_rdata* cpu.c_rst_n*}] -to [get_cells {cpu.core.*}]
+set_multicycle_path -setup 3 -hold 2 -from [get_cells {cpu.core.*}] -to [get_cells {cpu.q_*}]

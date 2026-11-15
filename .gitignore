@@ -22,3 +22,6 @@ syn/b64/*.mem
 syn/b64/base64.lpf
 syn/b64/base64_top_020.sv
 syn/arith.txt
+syn/bit/out/
+sim/lockstep_fx3
+sim/obj_fx3/
