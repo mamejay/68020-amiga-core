@@ -25,8 +25,8 @@ module m68020_core (
   output logic        halted,       // double bus fault
 
   // ---- debug / verification ----
-  output logic        dbg_retire,   // 1-clock pulse: an instruction (plus any exception it raised, incl. trace) completed
-  output logic [31:0] dbg_pc,       // PC of next instruction to execute (valid when dbg_retire)
+  output logic        dbg_retire,   // pulse (one ce period): an instruction, plus any exception/interrupt/trace taken after it, completed
+  output logic [31:0] dbg_pc,       // address of the next instruction (its opcode has just been fetched); valid with dbg_retire
   output logic [15:0] dbg_sr,
   output logic [255:0] dbg_d,       // D7..D0, D0 in [31:0]
   output logic [255:0] dbg_a,       // A7..A0, A0 in [31:0]; A7 = currently active stack pointer
@@ -39,6 +39,8 @@ Rules
   request in the following cycle (bus_req can stay high across back-to-back transfers). Slaves must not ack when bus_req is low.
 * Instruction fetches are long-word (size 2) reads at 4-byte-aligned addresses, fc = 2/6.
 * Interrupt acknowledge: read, size byte, fc = 7, addr = 32'hFFFFFFF1 | (level << 1). Slave returns vector in rdata[7:0], or asserts bus_avec with bus_ack.
-* Reset sequence: long read of SSP at 0, long read of PC at 4 (fc = 6? -> real 68020 uses fc=5 data? we use 6 for both).
+* Reset sequence: long read of SSP at 0, long read of PC at 4 (fc = 6 for both). D0-D7, A0-A6, USP and MSP are cleared
+  at reset (the real 68020 leaves them undefined; clearing makes simulation deterministic).
+* dbg_d/dbg_a/dbg_usp/dbg_isp/dbg_msp come from a shadow copy of the register file that only exists with DEBUG=1.
 * All inputs (bus_ack, bus_berr, bus_avec, bus_rdata, ipl) are sampled only on clock edges where ce=1.
   A slave must therefore hold bus_ack/bus_berr until an edge with ce=1 (or run with ce tied high).

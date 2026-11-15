@@ -1,0 +1,12 @@
+m68020_core and associated files (rtl/, sim/ harness sources, doc/)
+Copyright (c) 2026 Jason (ITMD). All rights reserved.
+
+No licence has been chosen yet. Until one is added here, no permission is granted to copy,
+modify or distribute these files.
+
+Third-party code in this repository keeps its own licence:
+  sim/musashi/  - Musashi 68000-family emulator, Copyright (c) 1998-2001 Karl Stenerud
+                  (see sim/musashi/readme.txt); modified, see sim/musashi/MODIFICATIONS.md.
+                  Used only as the reference model of the test harness.
+The core was written from the Motorola documentation; TG68K.C (LGPL-3) and base64_gateware
+were read for reference only and no code was copied from them.
