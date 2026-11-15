@@ -13,3 +13,12 @@ sim/tests/*.elf
 syn/*.json
 syn/*.log
 *.vcd
+sim/obj_*/
+sim/lockstep_fx
+syn/abl/
+syn/b64/*.json
+syn/b64/*.log
+syn/b64/*.mem
+syn/b64/base64.lpf
+syn/b64/base64_top_020.sv
+syn/arith.txt

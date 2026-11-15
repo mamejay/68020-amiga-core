@@ -1,0 +1,14 @@
+# ---------------------------------------------------------------------
+# m68020 core (rtl/m68020_core.sv inside rtl/m68020_fx68k.sv, instance "cpu")
+#
+# Add to fx68k/constraints/base64.fdc AFTER removing every constraint and
+# define_attribute that names cpu.excUnit.* or cpu.U_nanoRom_t3.* (fx68k cells
+# that no longer exist -> BN105 warnings).
+#
+# Every flop inside cpu.core is clock-enabled every CE_DIV-th clk_12x, and the
+# wrapper only changes the core's inputs on those enable edges, so all paths
+# into and inside the core are CE_DIV-cycle paths.  Values below are for
+# CE_DIV = 3 (setup 3, hold 2).  For CE_DIV = 4 use -setup 4 -hold 3.
+# ---------------------------------------------------------------------
+set_multicycle_path -setup 3 -hold 2 -from [get_cells {cpu.core.*}] -to [get_cells {cpu.core.*}]
+set_multicycle_path -setup 3 -hold 2 -from [get_cells {cpu.c_ack* cpu.c_berr* cpu.c_rdata*}] -to [get_cells {cpu.core.*}]

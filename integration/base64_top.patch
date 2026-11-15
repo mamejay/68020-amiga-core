@@ -1,0 +1,11 @@
+--- a/rtl/base64_fx68k/base64_top.sv	2026-11-16 00:54:50.774580401 +1100
++++ b/rtl/base64_fx68k/base64_top.sv	2026-11-16 00:54:50.775961076 +1100
+@@ -703,7 +703,7 @@
+                                  | int_dtack_lo);
+     wire        core_berr_n  = ~core_berr_lo;
+ 
+-    fx68k cpu (
++    m68020_fx68k #(.CE_DIV(3)) cpu (   // 68020 core (was: fx68k cpu)
+         .clk      (clk),
+         .enPhi1   (en_phi1),
+         .enPhi2   (en_phi2),
