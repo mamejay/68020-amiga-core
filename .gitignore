@@ -2,6 +2,8 @@ ref/
 sim/obj_dir/
 sim/obj_mus/
 sim/lockstep
+sim/lockstep_fx
+sim/obj_fx/
 sim/musashi/m68kmake
 sim/musashi/m68kops.c
 sim/musashi/m68kops.h

@@ -96,7 +96,7 @@ typedef enum logic [7:0] {
     S_MEM, S_IFETCH,
     // effective address engine
     E_START, E_D16, E_ABSW, E_ABSL1, E_ABSL2, E_IMM1, E_IMM2, E_IDX, E_BDW, E_BDL1, E_BDL2,
-    E_FULL, E_ODW, E_ODL1, E_ODL2, E_MI, E_MI2,
+    E_IDX2, E_FULL, E_ODW, E_ODL1, E_ODL2, E_MI, E_MI2,
     // generic ALU flow
     G_SRC, G_SRC_RD, G_SRC_RD2, G_DST, G_DST_RD, G_DST_RD2, G_EXEC, G_WB,
     // misc
@@ -113,7 +113,7 @@ typedef enum logic [7:0] {
     S_DIVW, S_DIVLX, S_DIVL, S_DIV_ABS1, S_DIV_ABS2, S_DIV_LOOP, S_DIV_FIN, S_DIV_FIN2,
     S_SHIFT, S_ROX, S_SHIFTM,
     S_BITX, S_BITD, S_BIT,
-    S_BFX, S_BFE, S_BF0, S_BF1, S_BF2, S_BF3, S_BF4, S_BF5,
+    S_BFX, S_BFE, S_BF0, S_BF1, S_BF2, S_BF3, S_BF4, S_BF5, S_BF6,
     S_CASX, S_CASE, S_CAS, S_CAS1,
     S_CAS2X1, S_CAS2X2, S_CAS2R1, S_CAS2R2, S_CAS2C1, S_CAS2C2, S_CAS2C3,
     S_CAS2W1, S_CAS2W2, S_CAS2F1, S_CAS2F2,
@@ -433,16 +433,16 @@ wire         int_pending = (ipl_q == 3'd7) ? (nmi_latch || sr[10:8] != 3'd7) : (
 // register file: D0-D7 = 0..7, A0-A6 = 8..14, USP 15, ISP 16, MSP 17
 // one registered write request (applied on the next edge, bypassed to reads)
 // -----------------------------------------------------------------------------
-logic [31:0] rf [0:31];
-logic        rfw_en;
-logic [4:0]  rfw_a;
-logic [31:0] rfw_d;
-logic [1:0]  rfw_sz;
-wire  [31:0] rfw_old = rf[rfw_a];
-wire  [31:0] rfw_m   = merge(rfw_old, rfw_d, rfw_sz);
-always_ff @(posedge clk) begin
-    if (ce && rfw_en) rf[rfw_a] <= rfw_m;
-end
+// register-file write intent of the current cycle (blocking, set by `RFW in the FSM)
+logic        w_en;
+logic [4:0]  w_a;
+logic [31:0] w_d;
+logic [1:0]  w_sz;
+// three byte-lane memories so sized writes need no read-modify-write;
+// written directly by the FSM (visible to reads on the next clock)
+logic [7:0]  rf_b0 [0:31];
+logic [7:0]  rf_b1 [0:31];
+logic [15:0] rf_hi [0:31];
 
 wire  [4:0]  sp_ph = !sr[13] ? P_USP : (sr[12] ? P_MSP : P_ISP);
 function automatic [4:0] ph(input [3:0] l, input [4:0] spp);
@@ -450,10 +450,10 @@ function automatic [4:0] ph(input [3:0] l, input [4:0] spp);
 endfunction
 
 logic [4:0]  raA, raB, raC;
-wire  [31:0] rA = (rfw_en && rfw_a == raA)  ? rfw_m : rf[raA];
-wire  [31:0] rB = (rfw_en && rfw_a == raB)  ? rfw_m : rf[raB];
-wire  [31:0] rC = (rfw_en && rfw_a == raC)  ? rfw_m : rf[raC];
-wire  [31:0] sp = (rfw_en && rfw_a == sp_ph) ? rfw_m : rf[sp_ph];
+wire  [31:0] rA = {rf_hi[raA],   rf_b1[raA],   rf_b0[raA]};
+wire  [31:0] rB = {rf_hi[raB],   rf_b1[raB],   rf_b0[raB]};
+wire  [31:0] rC = {rf_hi[raC],   rf_b1[raC],   rf_b0[raC]};
+wire  [31:0] sp = {rf_hi[sp_ph], rf_b1[sp_ph], rf_b0[sp_ph]};
 
 // -----------------------------------------------------------------------------
 // instruction prefetch buffer + instruction cache
@@ -469,9 +469,10 @@ wire  [5:0]  ic_idx = PC[7:2];
 wire  [24:0] ic_curtag = {sr[13], PC[31:8]};
 wire         ic_hit = ICACHE && cacr[0] && ic_valid[ic_idx] && (ic_tag[ic_idx] == ic_curtag);
 wire         ib_hit = ib_valid && (ib_tag == PC[31:2]);
-wire         iw_hit = ib_hit || ic_hit;
-wire  [31:0] iw_long = ib_hit ? ib_data : ic_data[ic_idx];
-wire  [15:0] iw = PC[1] ? iw_long[15:0] : iw_long[31:16];
+// instruction words only ever come from the prefetch buffer (flops); the cache
+// (block RAM) refills the buffer, costing one cycle per longword on a hit
+wire         iw_hit = ib_hit;
+wire  [15:0] iw = PC[1] ? ib_data[15:0] : ib_data[31:16];
 
 wire ic_we = ICACHE && ce && (state == S_IFETCH) && bus_ack && cacr[0] && !cacr[1];
 always_ff @(posedge clk) begin
@@ -484,7 +485,7 @@ end
 // -----------------------------------------------------------------------------
 // macros (statements, used inside the FSM)
 // -----------------------------------------------------------------------------
-`define RFW(PA, V, SZ) begin rfw_en <= 1'b1; rfw_a <= (PA); rfw_d <= (V); rfw_sz <= (SZ); end
+`define RFW(PA, V, SZ) begin w_en = 1'b1; w_a = (PA); w_d = (V); w_sz = (SZ); end
 `define WR_A(N, V)     `RFW(ph({1'b1, (N)}, sp_ph), V, SZ_L)
 `define WR_R(I, V)     `RFW(ph((I), sp_ph), V, SZ_L)
 `define WR_D(N, V, S)  `RFW({2'b00, (N)}, V, S)
@@ -499,8 +500,10 @@ end
 `define MEMWR(ADDR, SIZE, DATA, RET) `MEMX(ADDR, SIZE, 1'b1, DATA, `DFC, RET)
 
 `define NEED_IW(RET) begin \
+    if (ic_hit) begin ib_data <= ic_data[ic_idx]; ib_tag <= PC[31:2]; ib_valid <= 1'b1; end \
+    else begin \
     bus_req <= 1'b1; bus_we <= 1'b0; bus_addr <= {PC[31:2], 2'b00}; bus_size <= SZ_L; \
-    bus_fc <= sr[13] ? 3'd6 : 3'd2; if_ret <= (RET); state <= S_IFETCH; end
+    bus_fc <= sr[13] ? 3'd6 : 3'd2; if_ret <= (RET); state <= S_IFETCH; end end
 
 `define PUSHL(V, RET) begin `WR_SP(sp - 32'd4) `MEMWR(sp - 32'd4, SZ_L, V, RET) end
 `define PUSHW(V, RET) begin `WR_SP(sp - 32'd2) `MEMWR(sp - 32'd2, SZ_W, V, RET) end
@@ -556,7 +559,7 @@ always_comb begin
     sh_typ = IR[4:3]; sh_left = IR[8]; sh_sz = ir_sz; sh_n = cnt6; sh_v = tmp;
     case (state)
         S_SHIFTM: begin sh_typ = IR[10:9]; sh_sz = SZ_W; sh_n = 6'd1; sh_v = dst; end
-        S_BF0:    begin sh_typ = 2'b11; sh_left = 1'b1; sh_sz = SZ_L; sh_n = {1'b0, bf_off[4:0]}; sh_v = rA; end
+        S_BF0:    begin sh_typ = 2'b11; sh_left = 1'b1; sh_sz = SZ_L; sh_n = {1'b0, bf_off[4:0]}; sh_v = tmp; end
         S_BF5:    begin sh_typ = 2'b11; sh_left = 1'b0; sh_sz = SZ_L; sh_n = {1'b0, bf_off[4:0]}; sh_v = bf_buf[39:8]; end
         default: ;
     endcase
@@ -569,14 +572,15 @@ wire [2:0]  bf_sh   = bf_reg ? 3'd0 : bf_off[2:0];
 wire [39:0] bf_al   = bf_buf << bf_sh;
 wire [31:0] bf_fld  = bf_al[39:8] & bf_w32;
 wire [39:0] bf_msk  = {bf_w32, 8'd0} >> bf_sh;
-wire [31:0] bf_ins  = rB << (6'd32 - bf_w);                                        // port B = D[ext[14:12]]
+wire [31:0] bf_ins  = tmp2 << (6'd32 - bf_w);                                      // latched D[ext[14:12]]
 wire [39:0] bf_insv = {bf_ins & bf_w32, 8'd0} >> bf_sh;
-wire [32:0] bf_extv = $signed({(IR[10:8] == 3'b011) && bf_fld[31], bf_fld}) >>> (6'd32 - bf_w);
+logic [31:0] bf_fr;                                                                  // registered field
+wire [32:0] bf_extv = $signed({(IR[10:8] == 3'b011) && bf_fr[31], bf_fr}) >>> (6'd32 - bf_w);
 logic [5:0] bf_ffo;
 always_comb begin
     bf_ffo = bf_w;
     for (int k = 0; k < 32; k++)
-        if (bf_fld[k]) bf_ffo = 6'd31 - k[5:0];
+        if (bf_fr[k]) bf_ffo = 6'd31 - k[5:0];
 end
 logic [39:0] bf_nb;
 always_comb begin
@@ -645,8 +649,8 @@ always_comb begin
         S_CHK2R2:                raA = ph(ext[15:12], sp_ph);
         S_MULL:                  raA = {2'b00, ext[14:12]};
         S_DIVL: begin            raA = {2'b00, ext[14:12]}; raB = {2'b00, ext[2:0]}; end
-        S_BFE: begin             raA = {2'b00, ext[8:6]};   raB = {2'b00, ext[2:0]}; end
-        S_BF0, S_BF3: begin      raA = {2'b00, ir_r};       raB = {2'b00, ext[14:12]}; end
+        S_BFE: begin             raA = {2'b00, ext[8:6]};   raB = {2'b00, ext[2:0]}; raC = {2'b00, ir_r}; end
+        S_BF0:                   raB = {2'b00, ext[14:12]};
         S_CAS: begin             raA = {2'b00, ext[2:0]};   raB = {2'b00, ext[8:6]}; end
         S_CAS1:                  raB = {2'b00, ext[8:6]};
         S_CAS2X2:                raA = ph(ext[15:12], sp_ph);
@@ -701,10 +705,9 @@ assign dbg_pc  = PC;
 assign dbg_sr  = sr;
 assign dbg_vbr = vbr;
 assign halted  = (state == S_HALT);
+logic [31:0] shadow [0:31];      // debug copy of the register file (written with it)
 generate
     if (DEBUG) begin : g_dbg
-        logic [31:0] shadow [0:17];
-        always_ff @(posedge clk) if (ce && rfw_en) shadow[rfw_a] <= rfw_m;
         for (genvar gi = 0; gi < 8; gi++) begin : g_d
             assign dbg_d[gi*32 +: 32] = shadow[gi];
             if (gi < 7) begin : g_a
@@ -727,13 +730,13 @@ endgenerate
 // -----------------------------------------------------------------------------
 // main FSM
 // -----------------------------------------------------------------------------
+
 always_ff @(posedge clk) if (ce) begin
+    w_en = 1'b0; w_a = 5'd0; w_d = 32'd0; w_sz = SZ_L;
     // interrupt input sampling
     ipl_q    <= ipl;
     nmi_prev <= (ipl_q == 3'd7);
     if (ipl_q == 3'd7 && !nmi_prev) nmi_latch <= 1'b1;
-
-    rfw_en <= 1'b0;
 
     if (!rst_n) begin
         state     <= S_CLR;
@@ -954,10 +957,10 @@ always_ff @(posedge clk) if (ce) begin
             PC <= PC + 32'd2;
             ea_ext <= iw;
             if (!iw[8]) begin
-                // brief format (scale allowed on 68020)
-                ea_addr <= ea_base + sx8(iw[7:0]) + idx_val;
-                ea_kind <= K_M;
-                state <= ea_ret;
+                // brief format (scale allowed on 68020): base + d8 now, + index next cycle
+                ea_base <= ea_base + sx8(iw[7:0]);
+                ea_idx  <= idx_val;
+                state   <= E_IDX2;
             end else begin
                 ea_idx <= iw[6] ? 32'd0 : idx_val;
                 if (iw[7]) ea_base <= 32'd0;
@@ -967,6 +970,11 @@ always_ff @(posedge clk) if (ce) begin
                 else       state <= E_FULL;
             end
         end
+    end
+    E_IDX2: begin
+        ea_addr <= ea_base + ea_idx;
+        ea_kind <= K_M;
+        state <= ea_ret;
     end
     E_BDW: begin
         if (!iw_hit) `NEED_IW(E_BDW)
@@ -1091,6 +1099,16 @@ always_ff @(posedge clk) if (ce) begin
         sz          <= ir_sz;
         ssz         <= ir_sz;
         cnt3        <= 3'd0;
+        // T0 ("change of flow") also traces instructions that synchronise the pipeline:
+        // MOVE/ANDI/EORI/ORI to SR, MOVE An,USP, MOVEC, MOVES, CAS, CAS2, NOP, STOP
+        if (IR[15:8] == 8'h46 && IR[7:6] == 2'b11 ||                         // MOVE to SR
+            IR == 16'h007C || IR == 16'h027C || IR == 16'h0A7C ||            // ORI/ANDI/EORI to SR
+            IR[15:3] == 13'b0100_1110_0110_0 ||                              // MOVE An,USP
+            IR[15:1] == 15'b0100_1110_0111_101 ||                            // MOVEC
+            IR[15:8] == 8'h0E && IR[7:6] != 2'b11 ||                         // MOVES
+            IR[15:11] == 5'b00001 && IR[8:6] == 3'b011 && IR[10:9] != 2'b00 || // CAS / CAS2
+            IR == 16'h4E71 || IR == 16'h4E72)                                // NOP / STOP
+            flow <= 1'b1;
 
         casez (IR)
         // ------------------------------------------------------------- line 0
@@ -2164,9 +2182,11 @@ always_ff @(posedge clk) if (ce) begin
         bf_w   <= ext[5] ? ((rB[4:0] == 5'd0) ? 6'd32 : {1'b0, rB[4:0]})
                          : ((ext[4:0] == 5'd0) ? 6'd32 : {1'b0, ext[4:0]});
         bf_reg <= (ea_kind == K_D);
+        tmp    <= rC;                              // register operand D[ir_r]
         state  <= S_BF0;
     end
     S_BF0: begin
+        tmp2 <= rB;                                // BFINS source D[ext[14:12]]
         if (bf_reg) begin
             // register: rotate the field to the top (shifter: ROL Dn, offset)
             bf_buf <= {sh_o[31:0], 8'd0};
@@ -2204,12 +2224,8 @@ always_ff @(posedge clk) if (ce) begin
             sr[2] <= ((bf_ins & bf_w32) == 32'd0);
         end
         bf_buf <= bf_nb;
-        case (IR[10:8])
-            3'b001, 3'b011: `WR_D(ext[14:12], bf_extv[31:0], SZ_L)          // BFEXTU / BFEXTS
-            3'b101: `WR_D(ext[14:12], (bf_reg ? {27'd0, bf_off[4:0]} : bf_off) + {26'd0, bf_ffo}, SZ_L)  // BFFFO
-            default: ;
-        endcase
-        if (!bf_modify) state <= S_END;
+        bf_fr  <= bf_fld;
+        if (!bf_modify) state <= (IR[10:8] == 3'b000) ? S_END : S_BF6;
         else if (bf_reg) state <= S_BF5;
         else begin
             case (bf_bc)
@@ -2224,6 +2240,14 @@ always_ff @(posedge clk) if (ce) begin
     S_BF4: begin
         if (bf_bc == 3'd3) `MEMWR(bf_addr + 32'd2, SZ_B, {24'd0, bf_buf[23:16]}, S_END)
         else               `MEMWR(bf_addr + 32'd4, SZ_B, {24'd0, bf_buf[7:0]}, S_END)
+    end
+    S_BF6: begin
+        // BFEXTU / BFEXTS / BFFFO result from the registered field
+        if (IR[10:8] == 3'b101)
+            `WR_D(ext[14:12], (bf_reg ? {27'd0, bf_off[4:0]} : bf_off) + {26'd0, bf_ffo}, SZ_L)
+        else
+            `WR_D(ext[14:12], bf_extv[31:0], SZ_L)
+        state <= S_END;
     end
     S_BF5: begin
         // register: rotate back (shifter: ROR field, offset)
@@ -2529,6 +2553,14 @@ always_ff @(posedge clk) if (ce) begin
 
     default: state <= S_HALT;
     endcase
+    end
+
+    // register file write (one port, byte-lane enables)
+    if (w_en) begin
+        rf_b0[w_a] <= w_d[7:0];
+        if (w_sz != SZ_B) rf_b1[w_a] <= w_d[15:8];
+        if (w_sz == SZ_L) rf_hi[w_a] <= w_d[31:16];
+        if (DEBUG) shadow[w_a] <= merge(shadow[w_a], w_d, w_sz);
     end
 end
 

@@ -6658,6 +6658,7 @@ M68KMAKE_OP(move, 16, tos, d)
 {
 	if(FLAG_S)
 	{
+		m68ki_trace_t0();			   /* same as the memory form */
 		m68ki_set_sr(DY);
 		return;
 	}

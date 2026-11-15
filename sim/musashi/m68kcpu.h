@@ -2242,7 +2242,7 @@ static inline unsigned m68ki_bitfield_patch_offset(int32 offset) {
 }
 
 static inline uint32 m68ki_bitfield_patch_ea(uint32 ea, int32 offset) {
-	return ea + (offset >= 0 ? offset / 8 : -((7 - offset) / 8));
+	return ea + (uint32)(offset >> 3);   /* arithmetic shift; the old form overflowed for -2^31 */
 }
 
 static inline void m68ki_store_bitfield(uint32 addr, unsigned offset, unsigned width,

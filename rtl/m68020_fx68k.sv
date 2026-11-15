@@ -16,7 +16,9 @@
 // The core's 32-bit (possibly misaligned) transfers are split into 68000
 // byte/word cycles here.  Interrupt acknowledge is a normal FC=7 byte read;
 // the vector is taken from D7..D0 (base64 returns 24+level).
-// The core runs with ce = enPhi1 (one core clock per 68000 clock).
+// The core runs on a clock enable: CE_DIV = 2 uses enPhi1 (one core clock per
+// 68000 clock, 42.6 MHz on base64); CE_DIV = 3 / 4 run it at clk/3 or clk/4 for
+// timing closure (constrain the core's flop-to-flop paths as multicycle CE_DIV).
 //
 // Copyright (c) 2026 Jason (ITMD).  Licence: see LICENSE in the project root.
 // =============================================================================
@@ -26,7 +28,8 @@
 
 module m68020_fx68k #(
     parameter bit ICACHE = 1'b1,
-    parameter bit DEBUG  = 1'b0
+    parameter bit DEBUG  = 1'b0,
+    parameter int CE_DIV = 2
 ) (
     input  wire        clk,
     input  wire        HALTn,
@@ -85,12 +88,17 @@ reg         c_ack, c_berr;
 reg  [31:0] c_rdata;
 wire        c_reset_out, c_halted;
 
+// core clock enable
+reg  [2:0]  cediv = 3'd0;
+always @(posedge clk) cediv <= (cediv == CE_DIV - 1) ? 3'd0 : cediv + 3'd1;
+wire        core_ce = (CE_DIV == 2) ? enPhi1 : (cediv == 3'd0);
+
 reg  [2:0]  ipl_s;
 always @(posedge clk) if (enPhi2) ipl_s <= ~{IPL2n, IPL1n, IPL0n};
 
 m68020_core #(.ICACHE(ICACHE), .DEBUG(DEBUG)) core (
     .clk       (clk),
-    .ce        (enPhi1),
+    .ce        (core_ce),
     .rst_n     (!(extReset || pwrUp)),
     .bus_req   (c_req),
     .bus_we    (c_we),
@@ -152,8 +160,8 @@ function automatic [31:0] ralign(input [31:0] b, input [1:0] s);
 endfunction
 
 always @(posedge clk) begin
-    // the core samples ack/berr on enPhi1 edges: drop them once consumed
-    if (enPhi1 && (c_ack || c_berr)) begin
+    // the core samples ack/berr on its clock-enable edges: drop them once consumed
+    if (core_ce && (c_ack || c_berr)) begin
         c_ack  <= 1'b0;
         c_berr <= 1'b0;
     end

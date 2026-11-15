@@ -66,3 +66,8 @@ clean:
 	rm -rf obj_dir obj_mus lockstep .core_src tests/*.o tests/*.elf tests/*.bin
 
 .PHONY: all tests check clean musashi-check FORCE
+
+# lockstep through the fx68k-compatible wrapper (68000 bus cycles)
+lockstep_fx: lockstep.cpp tb_fx.sv $(RTL_DIR)/m68020_core.sv $(RTL_DIR)/m68020_fx68k.sv $(MUS_OBJ)
+	verilator $(VFLAGS) --Mdir obj_fx tb_fx.sv $(RTL_DIR)/m68020_core.sv $(RTL_DIR)/m68020_fx68k.sv lockstep.cpp -o Vtb
+	cp obj_fx/Vtb lockstep_fx
