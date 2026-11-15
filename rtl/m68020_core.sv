@@ -4,11 +4,15 @@
 // Written for the Base64 68000-socket accelerator (jbilander/Base64) as an
 // original implementation. Architecture:
 //   * multi-cycle FSM with shared effective-address and bus subroutines
-//   * unified 32-bit request/ack bus, misaligned data allowed (see doc/core_interface.md)
+//   * register file in distributed RAM: one (registered) write port with
+//     bypass, three general read ports + stack-pointer port
+//   * one ALU, one funnel shifter, one 16x16 multiplier, one 64-bit
+//     multiply/divide accumulator adder, all shared between instructions
+//   * unified 32-bit request/ack bus, misaligned data allowed (doc/core_interface.md)
 //   * 64-entry x 32-bit direct-mapped instruction cache (68020 compatible CACR)
 //     plus a one-longword prefetch buffer
 //   * full 68020 user + supervisor ISA except CALLM/RTM and coprocessor
-//     instructions (F-line trap), bus errors restart the instruction
+//     instructions (F-line trap); bus errors restart the instruction
 //
 // Copyright (c) 2026 Jason (ITMD).  Licence: see LICENSE in the project root.
 // =============================================================================
@@ -22,9 +26,11 @@
 
 module m68020_core #(
     parameter int RESET_CYCLES = 1024,   // length of RESET instruction pulse
-    parameter bit ICACHE       = 1'b1    // implement 64-entry instruction cache
+    parameter bit ICACHE       = 1'b1,   // implement 64-entry instruction cache
+    parameter bit DEBUG        = 1'b1    // drive the dbg_* register outputs (shadow copy)
 ) (
     input  logic         clk,
+    input  logic         ce,          // clock enable (tie 1 to run every clk)
     input  logic         rst_n,
 
     output logic         bus_req,
@@ -61,13 +67,13 @@ module m68020_core #(
 localparam [1:0] SZ_B = 2'd0, SZ_W = 2'd1, SZ_L = 2'd2;
 localparam [1:0] K_D = 2'd0, K_A = 2'd1, K_M = 2'd2, K_I = 2'd3;   // EA kinds
 localparam [15:0] SR_MASK = 16'hF71F;
+localparam [4:0] P_USP = 5'd15, P_ISP = 5'd16, P_MSP = 5'd17;      // physical RF slots
 
 // EA class bits (one-hot index)
 localparam int C_DN=0, C_AN=1, C_IND=2, C_PI=3, C_PD=4, C_D16=5, C_IDX=6,
                C_ABSW=7, C_ABSL=8, C_PCD=9, C_PCX=10, C_IMM=11;
 localparam [11:0] M_ALL      = 12'hFFF;
 localparam [11:0] M_DATA     = 12'hFFD;
-localparam [11:0] M_MEM      = 12'hFFC;
 localparam [11:0] M_CTRL     = 12'h7E4;
 localparam [11:0] M_ALT      = 12'h1FF;
 localparam [11:0] M_DALT     = 12'h1FD;
@@ -85,7 +91,7 @@ localparam [4:0] A_ADD=0, A_ADDX=1, A_SUB=2, A_SUBX=3, A_CMP=4, A_NEG=5, A_NEGX=
 // FSM states
 // -----------------------------------------------------------------------------
 typedef enum logic [7:0] {
-    S_RESET, S_RST1, S_RST2, S_RST3,
+    S_CLR, S_RESET, S_RST1, S_RST2,
     S_FETCH, S_DECODE, S_END, S_RETIRE, S_STOPPED, S_HALT,
     S_MEM, S_IFETCH,
     // effective address engine
@@ -94,53 +100,31 @@ typedef enum logic [7:0] {
     // generic ALU flow
     G_SRC, G_SRC_RD, G_SRC_RD2, G_DST, G_DST_RD, G_DST_RD2, G_EXEC, G_WB,
     // misc
-    S_IMMSR, S_IMMSR2, S_TOSR, S_MOVEM0, S_MOVEM1, S_MOVEM_L, S_MOVEM_LD, S_MOVEM_PD,
+    S_EXG2, S_IMMSR, S_IMMSR2, S_MOVEM0, S_MOVEM1, S_MOVEM_L, S_MOVEM_LD, S_MOVEM_PD,
     S_MOVEP0, S_MOVEP1, S_MOVEP2,
     S_BCC0, S_BCCW, S_BCCL1, S_BCCL2, S_BCCGO,
     S_DBCC, S_TRAPCC, S_TRAPCC2,
     S_JEA, S_JSR2, S_LEA, S_PEA,
-    S_LINK0, S_LINKL, S_LINK1, S_LINK2, S_UNLK1,
+    S_LINK0, S_LINKL, S_LINK1, S_LINK2, S_LINK3, S_UNLK1, S_UNLK2,
     S_RTS1, S_RTD0, S_RTD1, S_RTR1, S_RTR2,
     S_RTE0, S_RTE1, S_RTE2, S_RTE3, S_RTE4,
-    S_CHK, S_CHK2X, S_CHK2E, S_CHK2R1, S_CHK2R2,
-    S_MULW, S_MULLX, S_MULL, S_MUL_LOOP, S_MUL_FIN,
-    S_DIVW, S_DIVLX, S_DIVL, S_DIV_LOOP, S_DIV_FIN,
+    S_CHK, S_CHK1, S_CHK2X, S_CHK2E, S_CHK2R1, S_CHK2R2, S_CHK2C1, S_CHK2C2, S_CHK2C3,
+    S_MULW, S_MULLX, S_MULL, S_MUL_LOOP, S_MUL_FIN, S_MUL_FIN2,
+    S_DIVW, S_DIVLX, S_DIVL, S_DIV_ABS1, S_DIV_ABS2, S_DIV_LOOP, S_DIV_FIN, S_DIV_FIN2,
     S_SHIFT, S_ROX, S_SHIFTM,
     S_BITX, S_BITD, S_BIT,
-    S_BFX, S_BFE, S_BF0, S_BF1, S_BF2, S_BF3, S_BF4,
-    S_CASX, S_CASE, S_CAS, S_CAS2X1, S_CAS2X2, S_CAS2R1, S_CAS2R2, S_CAS2C, S_CAS2W1, S_CAS2W2,
+    S_BFX, S_BFE, S_BF0, S_BF1, S_BF2, S_BF3, S_BF4, S_BF5,
+    S_CASX, S_CASE, S_CAS, S_CAS1,
+    S_CAS2X1, S_CAS2X2, S_CAS2R1, S_CAS2R2, S_CAS2C1, S_CAS2C2, S_CAS2C3,
+    S_CAS2W1, S_CAS2W2, S_CAS2F1, S_CAS2F2,
     S_PACKX, S_PACKM1, S_PACKM2, S_PACKM3, S_UNPKM1, S_UNPKM2, S_UNPKM3, S_UNPKM4,
-    S_MOVECX, S_MOVESX, S_MOVESE, S_MOVES1, S_MOVES2,
+    S_MOVECX, S_MOVESX, S_MOVESE, S_MOVES1,
     S_STOP0, S_RESETI,
     S_INT0, S_INT1,
     X_START, X_F2, X_FA, X_FV, X_PC, X_SR, X_VEC, X_VEC2, X_T1, X_T2, X_T3, X_DONE
 } state_t;
 
 state_t state, ea_ret, mem_ret, if_ret, g_after_src, g_after_dst;
-
-// -----------------------------------------------------------------------------
-// architectural registers
-// -----------------------------------------------------------------------------
-logic [31:0] D [0:7];
-logic [31:0] A [0:7];   // A[7] unused (A7 = active stack pointer)
-logic [31:0] usp, isp, msp, vbr, cacr, caar;
-logic [2:0]  sfc, dfc;
-logic [15:0] sr;
-logic [31:0] PC, PCi;
-
-wire [31:0] sp = !sr[13] ? usp : (sr[12] ? msp : isp);
-
-wire [31:0] R [0:15];
-genvar gi;
-generate
-    for (gi = 0; gi < 8; gi++) begin : g_r
-        assign R[gi] = D[gi];
-        if (gi < 7) begin : g_a
-            assign R[gi+8] = A[gi];
-        end
-    end
-endgenerate
-assign R[15] = sp;
 
 // -----------------------------------------------------------------------------
 // helper functions
@@ -161,6 +145,9 @@ function automatic msbs(input [31:0] v, input [1:0] s);
 endfunction
 function automatic [2:0] szbytes(input [1:0] s);
     szbytes = s == SZ_B ? 3'd1 : s == SZ_W ? 3'd2 : 3'd4;
+endfunction
+function automatic [31:0] bitrev(input [31:0] v);
+    for (int i = 0; i < 32; i++) bitrev[i] = v[31-i];
 endfunction
 
 function automatic cond(input [3:0] cc, input [4:0] f);
@@ -217,15 +204,19 @@ function automatic [3:0] lsb16(input [15:0] m);
     for (int i = 15; i >= 0; i--) if (m[i]) lsb16 = i[3:0];
 endfunction
 
+function automatic [7:0] pack_b(input [15:0] v);
+    pack_b = {v[11:8], v[3:0]};
+endfunction
+
 // -----------------------------------------------------------------------------
 // ALU:  returns {flags_changed, ccr_new[4:0], result[31:0]}
 // -----------------------------------------------------------------------------
 function automatic [37:0] alu(input [4:0] op, input [1:0] s, input [31:0] sv, input [31:0] dv,
                               input [4:0] ccr, input cc_true);
     logic [4:0]  sh;
-    logic [31:0] sa, da, ra, r;
+    logic [31:0] sa, da, ra, r, ai, bi;
     logic [32:0] t;
-    logic        x, n, z, v, c, chg;
+    logic        x, n, z, v, c, chg, sub, cin;
     logic [9:0]  b;     // BCD intermediate
     logic        bc;
     sh = (s == SZ_B) ? 5'd24 : (s == SZ_W) ? 5'd16 : 5'd0;
@@ -234,25 +225,22 @@ function automatic [37:0] alu(input [4:0] op, input [1:0] s, input [31:0] sv, in
     x = ccr[4]; n = ccr[3]; z = ccr[2]; v = ccr[1]; c = ccr[0];
     chg = 1'b1;
     ra = 32'd0; r = 32'd0;
+    // one shared adder for ADD/ADDX/SUB/SUBX/CMP/NEG/NEGX (operands aligned to bit 31)
+    sub = !(op == A_ADD || op == A_ADDX);
+    ai  = (op == A_NEG || op == A_NEGX) ? 32'd0 : da;
+    bi  = (op == A_NEG || op == A_NEGX) ? da : sa;
+    cin = (op == A_ADDX || op == A_SUBX || op == A_NEGX) && x;
+    t   = sub ? ({1'b0, ai} - {1'b0, bi} - ({32'd0, cin} << sh))
+              : ({1'b0, ai} + {1'b0, bi} + ({32'd0, cin} << sh));
     case (op)
-        A_ADD, A_ADDX: begin
-            t = {1'b0, da} + {1'b0, sa} + ((op == A_ADDX && x) ? (33'd1 << sh) : 33'd0);
-            ra = t[31:0];
-            c = t[32]; x = c;
-            v = (sa[31] == da[31]) && (ra[31] != da[31]);
-            n = ra[31];
-            z = (op == A_ADDX) ? (z && ra == 32'd0) : (ra == 32'd0);
-            r = ra >> sh;
-        end
-        A_SUB, A_SUBX, A_CMP, A_NEG, A_NEGX: begin
-            if (op == A_NEG || op == A_NEGX) begin sa = da; da = 32'd0; end
-            t = {1'b0, da} - {1'b0, sa} - (((op == A_SUBX || op == A_NEGX) && x) ? (33'd1 << sh) : 33'd0);
+        A_ADD, A_ADDX, A_SUB, A_SUBX, A_CMP, A_NEG, A_NEGX: begin
             ra = t[31:0];
             c = t[32];
             if (op != A_CMP) x = c;
-            v = (sa[31] != da[31]) && (ra[31] != da[31]);
+            v = sub ? ((bi[31] != ai[31]) && (ra[31] != ai[31]))
+                    : ((bi[31] == ai[31]) && (ra[31] != ai[31]));
             n = ra[31];
-            z = (op == A_SUBX || op == A_NEGX) ? (z && ra == 32'd0) : (ra == 32'd0);
+            z = (op == A_ADDX || op == A_SUBX || op == A_NEGX) ? (z && ra == 32'd0) : (ra == 32'd0);
             r = ra >> sh;
         end
         A_AND, A_OR, A_EOR, A_NOT, A_MOVE, A_CLR, A_TST, A_TAS: begin
@@ -260,7 +248,7 @@ function automatic [37:0] alu(input [4:0] op, input [1:0] s, input [31:0] sv, in
                 A_AND:  ra = da & sa;
                 A_OR:   ra = da | sa;
                 A_EOR:  ra = da ^ sa;
-                A_NOT:  ra = ~da;
+                A_NOT:  ra = ~da & (32'hFFFF_FFFF << sh);
                 A_MOVE: ra = sa;
                 A_CLR:  ra = 32'd0;
                 default: ra = da;   // TST, TAS (flags from original)
@@ -271,15 +259,13 @@ function automatic [37:0] alu(input [4:0] op, input [1:0] s, input [31:0] sv, in
         end
         A_ADDA:   begin r = dv + sv; chg = 1'b0; end
         A_SUBA:   begin r = dv - sv; chg = 1'b0; end
-        A_PASS:   begin r = sv; chg = 1'b0; end
         A_SCC:    begin r = cc_true ? 32'hFF : 32'h00; chg = 1'b0; end
-        A_FROMSR: begin r = sv; chg = 1'b0; end
         A_FROMCCR:begin r = {27'd0, ccr}; chg = 1'b0; end
         A_ABCD: begin
             b = {6'd0, dv[3:0]} + {6'd0, sv[3:0]} + {9'd0, x};
             v = ~b[7];
             if (b > 10'd9) b = b + 10'd6;
-            b = b + {6'd0, dv[7:4], 4'd0} + {6'd0, sv[7:4], 4'd0};
+            b = b + {2'd0, dv[7:4], 4'd0} + {2'd0, sv[7:4], 4'd0};
             bc = b > 10'h99;
             if (bc) b = b - 10'hA0;
             v = v & b[7];
@@ -291,7 +277,7 @@ function automatic [37:0] alu(input [4:0] op, input [1:0] s, input [31:0] sv, in
             b = {6'd0, dv[3:0]} - {6'd0, sv[3:0]} - {9'd0, x};
             v = ~b[7];
             if (b > 10'd9) b = b - 10'd6;
-            b = b + {6'd0, dv[7:4], 4'd0} - {6'd0, sv[7:4], 4'd0};
+            b = b + {2'd0, dv[7:4], 4'd0} - {2'd0, sv[7:4], 4'd0};
             bc = b > 10'h99;
             if (bc) b = b + 10'hA0;
             v = v & b[7];
@@ -312,92 +298,66 @@ function automatic [37:0] alu(input [4:0] op, input [1:0] s, input [31:0] sv, in
             end else begin
                 v = 1'b0; c = 1'b0; x = 1'b0;
             end
-            n = b[7];
+            n = b[7];                    // undefined; matches Musashi (0x9A -> N=1)
+            if (b[7:0] == 8'h9A) b = 10'd0;   // 0 - 0 - 0 = 0
             r = {24'd0, b[7:0]};
         end
-        default: begin r = sv; chg = 1'b0; end
+        default: begin r = sv; chg = 1'b0; end   // PASS, FROMSR, TOSR, TOCCR
     endcase
     alu = {chg, x, n, z, v, c, r};
 endfunction
 
 // -----------------------------------------------------------------------------
-// shifter (AS/LS/RO, not ROX): returns {ccr_new, result}
+// shifter (AS/LS/RO, not ROX) built around one 65-bit right funnel shift:
+// returns {ccr_new, result}
 // -----------------------------------------------------------------------------
 function automatic [36:0] shifter(input [1:0] typ, input left, input [1:0] s,
                                   input [5:0] cnt, input [31:0] vin, input [4:0] ccr);
-    logic [31:0] v, va, r, m, bits;
-    logic [63:0] e, rep;
-    logic [5:0]  w, n;
-    logic        x, c, vf;
-    w  = s == SZ_B ? 6'd8 : s == SZ_W ? 6'd16 : 6'd32;
-    v  = zxs(vin, s);
-    x  = ccr[4]; c = 1'b0; vf = 1'b0; r = 32'd0;
-    if (typ[1] == 1'b0) begin
-        // arithmetic / logical
-        if (left) begin
-            va = v << (6'd32 - w);
-            e  = {32'd0, va} << cnt;
-            r  = e[31:0] >> (6'd32 - w);
-            c  = (cnt == 0) ? 1'b0 : e[32];
-            if (typ == 2'b00) begin  // ASL overflow
-                m    = (cnt >= 6'd31) ? 32'hFFFF_FFFF : ~(32'hFFFF_FFFF >> (cnt + 6'd1));
-                bits = va & m;
-                vf   = !(bits == 32'd0 || bits == m);
-            end
-        end else begin
-            e = (typ == 2'b00) ? {{32{msbs(v, s)}}, sxs(v, s)} : {32'd0, v};
-            r = $signed(e) >>> cnt;
-            if (cnt == 0) c = 1'b0;
-            else c = e[cnt - 6'd1];
-            r = zxs(r, s);
-        end
-        if (cnt != 0) x = c;
+    logic [31:0] v, va, r, m, bits, rep;
+    logic [65:0] xsrc, y;
+    logic [5:0]  w, n, amt;
+    logic        x, c, vf, msb;
+    w   = s == SZ_B ? 6'd8 : s == SZ_W ? 6'd16 : 6'd32;
+    v   = zxs(vin, s);
+    msb = msbs(v, s);
+    va  = v << (6'd32 - w);                                 // operand aligned to bit 31
+    rep = s == SZ_B ? {4{v[7:0]}} : s == SZ_W ? {2{v[15:0]}} : v;
+    n   = cnt & (w - 6'd1);
+    x = ccr[4]; vf = 1'b0;
+    if (typ == 2'b11) begin
+        xsrc = {1'b0, rep, rep, 1'b0};
+        amt  = left ? ((w - n) & (w - 6'd1)) : n;
+    end else if (left) begin
+        xsrc = {33'd0, bitrev(va), 1'b0};
+        amt  = (cnt > 6'd33) ? 6'd33 : cnt;          // >= 33 gives the same result
     end else begin
-        // rotate (typ 11)
-        n   = cnt & (w - 6'd1);
-        rep = s == SZ_B ? {8{v[7:0]}} : s == SZ_W ? {4{v[15:0]}} : {2{v}};
-        if (left) begin
-            e = rep << n;
-            r = s == SZ_B ? {24'd0, e[63:56]} : s == SZ_W ? {16'd0, e[63:48]} : e[63:32];
-            c = (cnt == 0) ? 1'b0 : r[0];
-        end else begin
-            e = rep >> n;
-            r = zxs(e[31:0], s);
-            c = (cnt == 0) ? 1'b0 : msbs(r, s);
+        xsrc = {{33{(typ == 2'b00) && msb}}, (typ == 2'b00) ? sxs(v, s) : v, 1'b0};
+        amt  = (cnt > 6'd33) ? 6'd33 : cnt;
+    end
+    y = xsrc >> amt;
+    if (typ == 2'b11) begin
+        r = zxs(y[32:1], s);
+        c = (cnt == 0) ? 1'b0 : (left ? r[0] : msbs(r, s));
+    end else begin
+        r = left ? (bitrev(y[32:1]) >> (6'd32 - w)) : zxs(y[32:1], s);
+        c = (cnt == 0) ? 1'b0 : y[0];
+        if (cnt != 0) x = c;
+        if (typ == 2'b00 && left) begin   // ASL overflow: top cnt+1 bits not all equal
+            m    = (cnt >= 6'd31) ? 32'hFFFF_FFFF : ~(32'hFFFF_FFFF >> (cnt + 6'd1));
+            bits = va & m;
+            vf   = !(bits == 32'd0 || bits == m);
         end
     end
-    shifter = {x, msbs(r, s), zxs(r, s) == 32'd0, vf, c, r};
+    shifter = {x, msbs(r, s), r == 32'd0, vf, c, r};
 endfunction
-
-// -----------------------------------------------------------------------------
-// instruction prefetch buffer + instruction cache
-// -----------------------------------------------------------------------------
-logic [29:0] ib_tag;
-logic [31:0] ib_data;
-logic        ib_valid;
-
-logic [63:0] ic_valid;
-logic [31:0] ic_data [0:63];
-logic [24:0] ic_tag  [0:63];
-wire  [5:0]  ic_idx = PC[7:2];
-wire  [24:0] ic_curtag = {sr[13], PC[31:8]};
-wire         ic_hit = ICACHE && cacr[0] && ic_valid[ic_idx] && (ic_tag[ic_idx] == ic_curtag);
-wire         ib_hit = ib_valid && (ib_tag == PC[31:2]);
-wire         iw_hit = ib_hit || ic_hit;
-wire  [31:0] iw_long = ib_hit ? ib_data : ic_data[ic_idx];
-wire  [15:0] iw = PC[1] ? iw_long[15:0] : iw_long[31:16];
-
-wire ic_we = ICACHE && (state == S_IFETCH) && bus_ack && cacr[0] && !cacr[1];
-always_ff @(posedge clk) begin
-    if (ic_we) begin
-        ic_data[bus_addr[7:2]] <= bus_rdata;
-        ic_tag[bus_addr[7:2]]  <= {bus_fc[2], bus_addr[31:8]};
-    end
-end
 
 // -----------------------------------------------------------------------------
 // working registers
 // -----------------------------------------------------------------------------
+logic [15:0] sr;
+logic [31:0] PC, PCi, vbr, cacr, caar;
+logic [2:0]  sfc, dfc;
+
 logic [15:0] IR, ext, ext2;
 logic [1:0]  sz, ssz;                // op size, source size
 logic [2:0]  ea_mode, ea_reg;
@@ -405,7 +365,6 @@ logic [1:0]  ea_sz;
 logic [1:0]  ea_kind;
 logic [31:0] ea_addr, ea_imm, ea_base, ea_bd, ea_od, ea_idx;
 logic [15:0] ea_ext;
-logic        ea_pc;
 
 logic [2:0]  src_mode, src_reg, dst_mode, dst_reg;
 logic        g_src_ea;               // src from EA (else preset)
@@ -442,15 +401,16 @@ logic [31:0] mvm_addr;
 logic [2:0]  cnt3;
 logic [5:0]  cnt6;
 logic [31:0] reset_cnt;
+logic [1:0]  flg;                    // CHK2 comparison results
 
 // multiplier / divider
 logic [31:0] md_a, md_b;
 logic [63:0] md_acc;
-logic [1:0]  md_step;
+logic [2:0]  md_step;
 logic [15:0] mul_x, mul_y;
 wire  [31:0] mul_p = mul_x * mul_y;
-logic        md_neg, md_rneg, md_signed, md_long64, md_word;
-logic [31:0] md_q, md_r;
+logic        md_neg, md_rneg, md_signed, md_long64, md_word, md_bneg;
+logic [31:0] md_q;
 logic [32:0] md_rem;
 logic [5:0]  md_cnt;
 
@@ -459,9 +419,10 @@ logic [31:0] bf_off;
 logic [5:0]  bf_w;
 logic [39:0] bf_buf;
 logic [2:0]  bf_bc;
+logic [31:0] bf_addr;
+logic        bf_reg;
 wire  [6:0]  bf_bsum   = {4'd0, bf_off[2:0]} + {1'b0, bf_w} + 7'd7;
 wire  [2:0]  bf_bcount = bf_bsum[5:3];
-logic [31:0] bf_addr;
 
 // interrupts
 logic [2:0]  ipl_q;
@@ -469,15 +430,65 @@ logic        nmi_prev, nmi_latch;
 wire         int_pending = (ipl_q == 3'd7) ? (nmi_latch || sr[10:8] != 3'd7) : (ipl_q > sr[10:8]);
 
 // -----------------------------------------------------------------------------
-// macros for register / bus access (statements, used inside the FSM)
+// register file: D0-D7 = 0..7, A0-A6 = 8..14, USP 15, ISP 16, MSP 17
+// one registered write request (applied on the next edge, bypassed to reads)
 // -----------------------------------------------------------------------------
-`define WR_A(N, V) \
-    if ((N) == 3'd7) begin \
-        if (!sr[13]) usp <= (V); else if (sr[12]) msp <= (V); else isp <= (V); \
-    end else A[(N)] <= (V);
+logic [31:0] rf [0:31];
+logic        rfw_en;
+logic [4:0]  rfw_a;
+logic [31:0] rfw_d;
+logic [1:0]  rfw_sz;
+wire  [31:0] rfw_old = rf[rfw_a];
+wire  [31:0] rfw_m   = merge(rfw_old, rfw_d, rfw_sz);
+always_ff @(posedge clk) begin
+    if (ce && rfw_en) rf[rfw_a] <= rfw_m;
+end
 
-`define WR_R(I, V) \
-    if ((I) >= 4'd8) begin `WR_A(((I) - 4'd8), V) end else D[(I)] <= (V);
+wire  [4:0]  sp_ph = !sr[13] ? P_USP : (sr[12] ? P_MSP : P_ISP);
+function automatic [4:0] ph(input [3:0] l, input [4:0] spp);
+    ph = (l == 4'd15) ? spp : {1'b0, l};
+endfunction
+
+logic [4:0]  raA, raB, raC;
+wire  [31:0] rA = (rfw_en && rfw_a == raA)  ? rfw_m : rf[raA];
+wire  [31:0] rB = (rfw_en && rfw_a == raB)  ? rfw_m : rf[raB];
+wire  [31:0] rC = (rfw_en && rfw_a == raC)  ? rfw_m : rf[raC];
+wire  [31:0] sp = (rfw_en && rfw_a == sp_ph) ? rfw_m : rf[sp_ph];
+
+// -----------------------------------------------------------------------------
+// instruction prefetch buffer + instruction cache
+// -----------------------------------------------------------------------------
+logic [29:0] ib_tag;
+logic [31:0] ib_data;
+logic        ib_valid;
+
+logic [63:0] ic_valid;
+logic [31:0] ic_data [0:63];
+logic [24:0] ic_tag  [0:63];
+wire  [5:0]  ic_idx = PC[7:2];
+wire  [24:0] ic_curtag = {sr[13], PC[31:8]};
+wire         ic_hit = ICACHE && cacr[0] && ic_valid[ic_idx] && (ic_tag[ic_idx] == ic_curtag);
+wire         ib_hit = ib_valid && (ib_tag == PC[31:2]);
+wire         iw_hit = ib_hit || ic_hit;
+wire  [31:0] iw_long = ib_hit ? ib_data : ic_data[ic_idx];
+wire  [15:0] iw = PC[1] ? iw_long[15:0] : iw_long[31:16];
+
+wire ic_we = ICACHE && ce && (state == S_IFETCH) && bus_ack && cacr[0] && !cacr[1];
+always_ff @(posedge clk) begin
+    if (ic_we) begin
+        ic_data[bus_addr[7:2]] <= bus_rdata;
+        ic_tag[bus_addr[7:2]]  <= {bus_fc[2], bus_addr[31:8]};
+    end
+end
+
+// -----------------------------------------------------------------------------
+// macros (statements, used inside the FSM)
+// -----------------------------------------------------------------------------
+`define RFW(PA, V, SZ) begin rfw_en <= 1'b1; rfw_a <= (PA); rfw_d <= (V); rfw_sz <= (SZ); end
+`define WR_A(N, V)     `RFW(ph({1'b1, (N)}, sp_ph), V, SZ_L)
+`define WR_R(I, V)     `RFW(ph((I), sp_ph), V, SZ_L)
+`define WR_D(N, V, S)  `RFW({2'b00, (N)}, V, S)
+`define WR_SP(V)       `RFW(sp_ph, V, SZ_L)
 
 `define MEMX(ADDR, SIZE, WE, DATA, FC, RET) begin \
     bus_req <= 1'b1; bus_we <= (WE); bus_addr <= (ADDR); bus_size <= (SIZE); \
@@ -491,8 +502,8 @@ wire         int_pending = (ipl_q == 3'd7) ? (nmi_latch || sr[10:8] != 3'd7) : (
     bus_req <= 1'b1; bus_we <= 1'b0; bus_addr <= {PC[31:2], 2'b00}; bus_size <= SZ_L; \
     bus_fc <= sr[13] ? 3'd6 : 3'd2; if_ret <= (RET); state <= S_IFETCH; end
 
-`define PUSHL(V, RET) begin `WR_A(3'd7, sp - 32'd4) `MEMWR(sp - 32'd4, SZ_L, V, RET) end
-`define PUSHW(V, RET) begin `WR_A(3'd7, sp - 32'd2) `MEMWR(sp - 32'd2, SZ_W, V, RET) end
+`define PUSHL(V, RET) begin `WR_SP(sp - 32'd4) `MEMWR(sp - 32'd4, SZ_L, V, RET) end
+`define PUSHW(V, RET) begin `WR_SP(sp - 32'd2) `MEMWR(sp - 32'd2, SZ_W, V, RET) end
 
 // exception: vector, format, stacked PC, address field.  Cancels trace.
 `define EXC(V, F, P, AD) begin \
@@ -517,35 +528,141 @@ wire [1:0]  ir_sz  = IR[7:6];
 wire [2:0]  ir_m   = IR[5:3];
 wire [2:0]  ir_r   = IR[2:0];
 wire [2:0]  ir_x   = IR[11:9];
-wire [11:0] ir_cls = eacls(ir_m, ir_r);
 
 // EA increment for (An)+ / -(An)
 wire [31:0] ea_inc = (ea_sz == SZ_B) ? ((ea_reg == 3'd7) ? 32'd2 : 32'd1) :
                      (ea_sz == SZ_W) ? 32'd2 : 32'd4;
-wire [31:0] ea_an  = R[{1'b1, ea_reg}];
 
-// index register from extension word currently at iw
-wire [31:0] idx_raw = R[iw[15:12]];
-wire [31:0] idx_val = (iw[11] ? idx_raw : sx16(idx_raw[15:0])) << iw[10:9];
+// index register (port B in E_IDX)
+wire [31:0] idx_val = (iw[11] ? rB : sx16(rB[15:0])) << iw[10:9];
 
-// ALU instance (combinational) for G_EXEC
+// shared ALU
 wire [31:0] alu_s = sext_src ? sxs(src, ssz) : src;
 wire [37:0] alu_o = alu(aop, sz, alu_s, dst, sr[4:0], cond(IR[11:8], sr[4:0]));
+wire        alu_z = alu_o[34];
+wire        alu_n = alu_o[35];
+wire        alu_v = alu_o[33];
 
-// shifter
-wire [5:0]  sh_cnt = IR[5] ? D[IR[11:9]][5:0] : (IR[11:9] == 3'd0 ? 6'd8 : {3'd0, IR[11:9]});
+// register shift count (decode, port A = D[ir_x])
+wire [5:0]  sh_cnt_dec = IR[5] ? rA[5:0] : (IR[11:9] == 3'd0 ? 6'd8 : {3'd0, IR[11:9]});
 
-// bitfield helpers
-wire [31:0] bf_w32   = (bf_w == 6'd32) ? 32'hFFFF_FFFF : ~(32'hFFFF_FFFF >> bf_w);  // top-aligned mask
-wire [4:0]  bf_ro    = bf_off[4:0];
-wire [63:0] bf_rot64 = {D[IR[2:0]], D[IR[2:0]]} << bf_ro;
+// shared shifter input selection
+logic [1:0]  sh_typ;
+logic        sh_left;
+logic [1:0]  sh_sz;
+logic [5:0]  sh_n;
+logic [31:0] sh_v;
+always_comb begin
+    sh_typ = IR[4:3]; sh_left = IR[8]; sh_sz = ir_sz; sh_n = cnt6; sh_v = tmp;
+    case (state)
+        S_SHIFTM: begin sh_typ = IR[10:9]; sh_sz = SZ_W; sh_n = 6'd1; sh_v = dst; end
+        S_BF0:    begin sh_typ = 2'b11; sh_left = 1'b1; sh_sz = SZ_L; sh_n = {1'b0, bf_off[4:0]}; sh_v = rA; end
+        S_BF5:    begin sh_typ = 2'b11; sh_left = 1'b0; sh_sz = SZ_L; sh_n = {1'b0, bf_off[4:0]}; sh_v = bf_buf[39:8]; end
+        default: ;
+    endcase
+end
+wire [36:0] sh_o = shifter(sh_typ, sh_left, sh_sz, sh_n, sh_v, sr[4:0]);
 
-function automatic [7:0] pack_b(input [15:0] v);
-    pack_b = {v[11:8], v[3:0]};
-endfunction
+// bitfield datapath (works on a 40-bit window, field starts at bit 39 - bf_sh)
+wire [31:0] bf_w32  = (bf_w == 6'd32) ? 32'hFFFF_FFFF : ~(32'hFFFF_FFFF >> bf_w);   // top-aligned mask
+wire [2:0]  bf_sh   = bf_reg ? 3'd0 : bf_off[2:0];
+wire [39:0] bf_al   = bf_buf << bf_sh;
+wire [31:0] bf_fld  = bf_al[39:8] & bf_w32;
+wire [39:0] bf_msk  = {bf_w32, 8'd0} >> bf_sh;
+wire [31:0] bf_ins  = rB << (6'd32 - bf_w);                                        // port B = D[ext[14:12]]
+wire [39:0] bf_insv = {bf_ins & bf_w32, 8'd0} >> bf_sh;
+wire [32:0] bf_extv = $signed({(IR[10:8] == 3'b011) && bf_fld[31], bf_fld}) >>> (6'd32 - bf_w);
+logic [5:0] bf_ffo;
+always_comb begin
+    bf_ffo = bf_w;
+    for (int k = 0; k < 32; k++)
+        if (bf_fld[k]) bf_ffo = 6'd31 - k[5:0];
+end
+logic [39:0] bf_nb;
+always_comb begin
+    case (IR[10:8])
+        3'b010:  bf_nb = bf_buf ^ bf_msk;                     // BFCHG
+        3'b100:  bf_nb = bf_buf & ~bf_msk;                    // BFCLR
+        3'b110:  bf_nb = bf_buf | bf_msk;                     // BFSET
+        3'b111:  bf_nb = (bf_buf & ~bf_msk) | bf_insv;        // BFINS
+        default: bf_nb = bf_buf;
+    endcase
+end
+wire bf_modify = IR[10:8] == 3'b010 || IR[10:8] == 3'b100 || IR[10:8] == 3'b110 || IR[10:8] == 3'b111;
 
-// end address of the current bus transfer (for write snooping)
-wire [31:0] bus_addr_end = bus_addr + ((bus_size == SZ_L) ? 32'd3 : (bus_size == SZ_W) ? 32'd1 : 32'd0);
+// multiply / divide shared 64-bit adder
+logic [63:0] md_x, md_y;
+logic        md_cin;
+always_comb begin
+    md_x = md_acc; md_y = 64'd0; md_cin = 1'b0;
+    case (state)
+        S_MUL_LOOP: begin
+            case (md_step)
+                3'd1: md_y = {32'd0, mul_p};
+                3'd2, 3'd3: md_y = {16'd0, mul_p, 16'd0};
+                3'd4: md_y = {mul_p, 32'd0};
+                3'd5: if (md_signed && md_a[31]) begin md_y = {~md_b, 32'hFFFF_FFFF}; md_cin = 1'b1; end
+                3'd6: if (md_signed && md_b[31]) begin md_y = {~md_a, 32'hFFFF_FFFF}; md_cin = 1'b1; end
+                default: ;
+            endcase
+        end
+        S_DIV_ABS1: begin md_x = ~md_acc; md_cin = 1'b1; end                     // -dividend
+        S_DIV_ABS2: begin md_x = {32'hFFFF_FFFF, ~md_b}; md_cin = 1'b1; end       // -divisor
+        S_DIV_FIN:  begin md_x = {32'd0, md_rneg ? ~md_rem[31:0] : md_rem[31:0]}; md_cin = md_rneg; end
+        S_DIV_FIN2: begin md_x = {32'd0, md_neg ? ~md_q : md_q}; md_cin = md_neg; end
+        default: ;
+    endcase
+end
+wire [63:0] md_sum = md_x + md_y + {63'd0, md_cin};
+
+// divider step: shift in next dividend bit, trial subtract (first cycle: overflow check)
+wire [32:0] div_r2   = (md_cnt == 6'd0) ? {1'b0, md_acc[63:32]} : {md_rem[31:0], md_q[31]};
+wire [33:0] div_diff = {1'b0, div_r2} - {2'b0, md_b};
+
+// -----------------------------------------------------------------------------
+// register file read port addressing (per state)
+// -----------------------------------------------------------------------------
+wire xa_dec = (IR[15:12] == 4'hC) && (IR[8:3] == 6'b101001);                       // EXG Ax,Ay
+wire ya_dec = (IR[15:8] == 8'h4E) || ((IR[15:12] == 4'hC) && IR[8] && IR[3]);      // UNLK/MOVE USP/EXG
+always_comb begin
+    raA = {2'b00, ir_x};
+    raB = {2'b00, ir_r};
+    raC = P_USP;
+    case (state)
+        S_DECODE: begin
+            raA = ph({xa_dec, ir_x}, sp_ph);
+            raB = ph({ya_dec, ir_r}, sp_ph);
+        end
+        E_START:                 raA = ph({1'b1, ea_reg}, sp_ph);
+        E_IDX:                   raB = ph(iw[15:12], sp_ph);
+        G_SRC_RD, G_DST_RD:      raA = ph({ea_kind == K_A, ea_reg}, sp_ph);
+        G_DST:                   raA = ph({g_dsel == 2'd2, dst_reg}, sp_ph);
+        S_MOVEM0, S_MOVEP0, S_LINK1: raA = ph({1'b1, ir_r}, sp_ph);
+        S_MOVEM_L:               raA = ph(lsb16(mvm_mask), sp_ph);
+        S_MOVEM_PD:              raA = ph(4'd15 - lsb16(mvm_mask), sp_ph);
+        S_DBCC, S_PACKX:         raA = {2'b00, ir_r};
+        S_CHK, S_MULW, S_DIVW:   raA = {2'b00, ir_x};
+        S_CHK2R2:                raA = ph(ext[15:12], sp_ph);
+        S_MULL:                  raA = {2'b00, ext[14:12]};
+        S_DIVL: begin            raA = {2'b00, ext[14:12]}; raB = {2'b00, ext[2:0]}; end
+        S_BFE: begin             raA = {2'b00, ext[8:6]};   raB = {2'b00, ext[2:0]}; end
+        S_BF0, S_BF3: begin      raA = {2'b00, ir_r};       raB = {2'b00, ext[14:12]}; end
+        S_CAS: begin             raA = {2'b00, ext[2:0]};   raB = {2'b00, ext[8:6]}; end
+        S_CAS1:                  raB = {2'b00, ext[8:6]};
+        S_CAS2X2:                raA = ph(ext[15:12], sp_ph);
+        S_CAS2R1:                raA = ph(ext2[15:12], sp_ph);
+        S_CAS2C1:                raA = {2'b00, ext[2:0]};
+        S_CAS2C2:                raB = {2'b00, ext2[2:0]};
+        S_CAS2W1: begin          raA = ph(ext[15:12], sp_ph);  raB = {2'b00, ext[8:6]}; end
+        S_CAS2W2: begin          raA = ph(ext2[15:12], sp_ph); raB = {2'b00, ext2[8:6]}; end
+        S_MOVECX: begin
+            raA = ph(iw[15:12], sp_ph);
+            raB = (iw[11:0] == 12'h803) ? P_MSP : (iw[11:0] == 12'h804) ? P_ISP : P_USP;
+        end
+        S_MOVESE:                raA = ph(ext[15:12], sp_ph);
+        default: ;   // default: port A = D[ir_x], port B = D[ir_r]
+    endcase
+end
 
 // MOVEC read mux (control register selected by the extension word at iw)
 logic [31:0] movec_rd;
@@ -554,12 +671,9 @@ always_comb begin
         12'h000: movec_rd = {29'd0, sfc};
         12'h001: movec_rd = {29'd0, dfc};
         12'h002: movec_rd = cacr;
-        12'h800: movec_rd = usp;
         12'h801: movec_rd = vbr;
         12'h802: movec_rd = caar;
-        12'h803: movec_rd = msp;
-        12'h804: movec_rd = isp;
-        default: movec_rd = 32'd0;
+        default: movec_rd = rB;          // USP / MSP / ISP via port B
     endcase
 end
 
@@ -576,35 +690,54 @@ always_comb begin
     endcase
 end
 
+// end address of the current bus transfer (for write snooping)
+wire [31:0] bus_addr_end = bus_addr + ((bus_size == SZ_L) ? 32'd3 : (bus_size == SZ_W) ? 32'd1 : 32'd0);
+
 // -----------------------------------------------------------------------------
-// debug outputs
+// debug outputs (shadow copy of the register file)
 // -----------------------------------------------------------------------------
-assign dbg_retire = (state == S_RETIRE);
+assign dbg_retire = (state == S_RETIRE) && ce;
 assign dbg_pc  = PC;
 assign dbg_sr  = sr;
-assign dbg_usp = usp;
-assign dbg_isp = isp;
-assign dbg_msp = msp;
 assign dbg_vbr = vbr;
+assign halted  = (state == S_HALT);
 generate
-    for (gi = 0; gi < 8; gi++) begin : g_dbg
-        assign dbg_d[gi*32 +: 32] = D[gi];
-        assign dbg_a[gi*32 +: 32] = R[gi+8];
+    if (DEBUG) begin : g_dbg
+        logic [31:0] shadow [0:17];
+        always_ff @(posedge clk) if (ce && rfw_en) shadow[rfw_a] <= rfw_m;
+        for (genvar gi = 0; gi < 8; gi++) begin : g_d
+            assign dbg_d[gi*32 +: 32] = shadow[gi];
+            if (gi < 7) begin : g_a
+                assign dbg_a[gi*32 +: 32] = shadow[gi + 8];
+            end
+        end
+        assign dbg_a[255:224] = shadow[sp_ph];
+        assign dbg_usp = shadow[P_USP];
+        assign dbg_isp = shadow[P_ISP];
+        assign dbg_msp = shadow[P_MSP];
+    end else begin : g_nodbg
+        assign dbg_d = '0;
+        assign dbg_a = '0;
+        assign dbg_usp = '0;
+        assign dbg_isp = '0;
+        assign dbg_msp = '0;
     end
 endgenerate
-assign halted = (state == S_HALT);
 
 // -----------------------------------------------------------------------------
 // main FSM
 // -----------------------------------------------------------------------------
-always_ff @(posedge clk) begin
+always_ff @(posedge clk) if (ce) begin
     // interrupt input sampling
     ipl_q    <= ipl;
     nmi_prev <= (ipl_q == 3'd7);
     if (ipl_q == 3'd7 && !nmi_prev) nmi_latch <= 1'b1;
 
+    rfw_en <= 1'b0;
+
     if (!rst_n) begin
-        state     <= S_RESET;
+        state     <= S_CLR;
+        cnt6      <= 6'd0;
         bus_req   <= 1'b0;
         bus_we    <= 1'b0;
         bus_lock  <= 1'b0;
@@ -614,9 +747,6 @@ always_ff @(posedge clk) begin
         bus_wdata <= 32'd0;
         sr        <= 16'h2700;
         vbr       <= 32'd0;
-        usp       <= 32'd0;
-        msp       <= 32'd0;
-        for (int k = 0; k < 8; k++) begin D[k] <= 32'd0; A[k] <= 32'd0; end
         cacr      <= 32'd0;
         caar      <= 32'd0;
         sfc       <= 3'd0;
@@ -634,13 +764,19 @@ always_ff @(posedge clk) begin
     case (state)
 
     // =========================================================================
-    // reset
+    // reset: clear the register file (D, A, USP, MSP defined as 0), then
+    // fetch SSP / PC
     // =========================================================================
+    S_CLR: begin
+        `RFW(cnt6[4:0], 32'd0, SZ_L)
+        cnt6 <= cnt6 + 6'd1;
+        if (cnt6 == 6'd17) state <= S_RESET;
+    end
     S_RESET: begin
         `MEMX(32'd0, SZ_L, 1'b0, 32'd0, 3'd6, S_RST1)
     end
     S_RST1: begin
-        isp <= mem_rd;
+        `RFW(P_ISP, mem_rd, SZ_L)
         `MEMX(32'd4, SZ_L, 1'b0, 32'd0, 3'd6, S_RST2)
     end
     S_RST2: begin
@@ -659,7 +795,7 @@ always_ff @(posedge clk) begin
             mem_avec <= bus_avec;
             state    <= mem_ret;
             if (bus_we) begin
-                // keep instruction stream coherent with our own writes
+                // keep the instruction stream coherent with our own writes
                 if (ib_tag == bus_addr[31:2] || ib_tag == bus_addr_end[31:2]) ib_valid <= 1'b0;
                 ic_valid[bus_addr[7:2]]     <= 1'b0;
                 ic_valid[bus_addr_end[7:2]] <= 1'b0;
@@ -693,7 +829,7 @@ always_ff @(posedge clk) begin
             bus_req <= 1'b0;
             if (in_exc) state <= S_HALT;
             else begin
-                x_ssw <= {16'h0006 | {13'd0, bus_fc}} | 16'h4000;
+                x_ssw <= 16'h4006 | {13'd0, bus_fc};
                 x_dob <= 32'd0;
                 `EXC(8'd2, 4'hA, PCi, bus_addr)
             end
@@ -749,23 +885,22 @@ always_ff @(posedge clk) begin
     S_HALT: ;
 
     // =========================================================================
-    // effective address engine
+    // effective address engine (port A = An, port B = index register)
     // =========================================================================
     E_START: begin
-        ea_pc <= 1'b0;
         case (ea_mode)
             3'd0: begin ea_kind <= K_D; state <= ea_ret; end
             3'd1: begin ea_kind <= K_A; state <= ea_ret; end
-            3'd2: begin ea_kind <= K_M; ea_addr <= ea_an; state <= ea_ret; end
-            3'd3: begin ea_kind <= K_M; ea_addr <= ea_an; `WR_A(ea_reg, ea_an + ea_inc) state <= ea_ret; end
-            3'd4: begin ea_kind <= K_M; ea_addr <= ea_an - ea_inc; `WR_A(ea_reg, ea_an - ea_inc) state <= ea_ret; end
-            3'd5: begin ea_base <= ea_an; state <= E_D16; end
-            3'd6: begin ea_base <= ea_an; state <= E_IDX; end
+            3'd2: begin ea_kind <= K_M; ea_addr <= rA; state <= ea_ret; end
+            3'd3: begin ea_kind <= K_M; ea_addr <= rA; `WR_A(ea_reg, rA + ea_inc) state <= ea_ret; end
+            3'd4: begin ea_kind <= K_M; ea_addr <= rA - ea_inc; `WR_A(ea_reg, rA - ea_inc) state <= ea_ret; end
+            3'd5: begin ea_base <= rA; state <= E_D16; end
+            3'd6: begin ea_base <= rA; state <= E_IDX; end
             default: case (ea_reg)
                 3'd0: state <= E_ABSW;
                 3'd1: state <= E_ABSL1;
-                3'd2: begin ea_base <= PC; ea_pc <= 1'b1; state <= E_D16; end
-                3'd3: begin ea_base <= PC; ea_pc <= 1'b1; state <= E_IDX; end
+                3'd2: begin ea_base <= PC; state <= E_D16; end
+                3'd3: begin ea_base <= PC; state <= E_IDX; end
                 3'd4: state <= E_IMM1;
                 default: `ILLEGAL
             endcase
@@ -846,6 +981,7 @@ always_ff @(posedge clk) begin
         else begin PC <= PC + 32'd2; ea_bd[15:0] <= iw; state <= E_FULL; end
     end
     E_FULL: begin
+        ea_base <= ea_base + ea_bd;
         if (ea_ext[2:0] == 3'd0) begin
             ea_addr <= ea_base + ea_bd + ea_idx;
             ea_kind <= K_M;
@@ -869,8 +1005,8 @@ always_ff @(posedge clk) begin
         else begin PC <= PC + 32'd2; ea_od[15:0] <= iw; state <= E_MI; end
     end
     E_MI: begin
-        if (ea_ext[2]) `MEMRD(ea_base + ea_bd, SZ_L, E_MI2)
-        else           `MEMRD(ea_base + ea_bd + ea_idx, SZ_L, E_MI2)
+        // ea_base already holds base + bd
+        `MEMRD(ea_base + (ea_ext[2] ? 32'd0 : ea_idx), SZ_L, E_MI2)
     end
     E_MI2: begin
         ea_addr <= mem_rd + (ea_ext[2] ? ea_idx : 32'd0) + ea_od;
@@ -887,10 +1023,9 @@ always_ff @(posedge clk) begin
     end
     G_SRC_RD: begin
         case (ea_kind)
-            K_D: begin src <= D[ea_reg]; state <= g_after_src; end
-            K_A: begin src <= R[{1'b1, ea_reg}]; state <= g_after_src; end
-            K_I: begin src <= ea_imm; state <= g_after_src; end
-            default: `MEMRD(ea_addr, ssz, G_SRC_RD2)
+            K_D, K_A: begin src <= rA; state <= g_after_src; end
+            K_I:      begin src <= ea_imm; state <= g_after_src; end
+            default:  `MEMRD(ea_addr, ssz, G_SRC_RD2)
         endcase
     end
     G_SRC_RD2: begin
@@ -900,8 +1035,8 @@ always_ff @(posedge clk) begin
     G_DST: begin
         case (g_dsel)
             2'd0: `CALL_EA(dst_mode, dst_reg, sz, G_DST_RD)
-            2'd1: begin dst <= D[dst_reg]; dst_kind <= K_D; dst_rn <= dst_reg; state <= g_after_dst; end
-            default: begin dst <= R[{1'b1, dst_reg}]; dst_kind <= K_A; dst_rn <= dst_reg; state <= g_after_dst; end
+            2'd1: begin dst <= rA; dst_kind <= K_D; dst_rn <= dst_reg; state <= g_after_dst; end
+            default: begin dst <= rA; dst_kind <= K_A; dst_rn <= dst_reg; state <= g_after_dst; end
         endcase
     end
     G_DST_RD: begin
@@ -909,9 +1044,8 @@ always_ff @(posedge clk) begin
         dst_addr <= ea_addr;
         dst_rn   <= ea_reg;
         case (ea_kind)
-            K_D: begin dst <= D[ea_reg]; state <= g_after_dst; end
-            K_A: begin dst <= R[{1'b1, ea_reg}]; state <= g_after_dst; end
-            K_I: begin dst <= ea_imm; state <= g_after_dst; end
+            K_D, K_A: begin dst <= rA; state <= g_after_dst; end
+            K_I:      begin dst <= ea_imm; state <= g_after_dst; end
             default: if (g_rd) `MEMRD(ea_addr, sz, G_DST_RD2)
                      else state <= g_after_dst;
         endcase
@@ -932,14 +1066,14 @@ always_ff @(posedge clk) begin
     end
     G_WB: begin
         case (dst_kind)
-            K_D: begin D[dst_rn] <= merge(D[dst_rn], res, sz); state <= S_END; end
+            K_D: begin `WR_D(dst_rn, res, sz) state <= S_END; end
             K_A: begin `WR_A(dst_rn, res) state <= S_END; end
             default: `MEMWR(dst_addr, sz, res, S_END)
         endcase
     end
 
     // =========================================================================
-    // decode
+    // decode   (port A = Dx / Ax, port B = Dy / Ay, port C = USP)
     // =========================================================================
     S_DECODE: begin
         // defaults for the generic flow
@@ -977,7 +1111,6 @@ always_ff @(posedge clk) begin
         end
         16'b0000_1??0_11??_????: begin                             // CAS (or BSET #)
             if (IR[10:9] == 2'b00) begin
-                // static BSET
                 if (!eaok(ir_m, ir_r, M_DALT)) `ILLEGAL
                 else state <= S_BITX;
             end else if (!eaok(ir_m, ir_r, M_MALT)) `ILLEGAL
@@ -991,7 +1124,7 @@ always_ff @(posedge clk) begin
         end
         16'b0000_???1_????_????: begin                             // dynamic bit op
             if (!eaok(ir_m, ir_r, (IR[7:6] == 2'b00) ? M_DATA : M_DALT)) `ILLEGAL
-            else begin src <= D[ir_x]; state <= S_BITD; end
+            else begin src <= rA; state <= S_BITD; end
         end
         16'b0000_1000_????_????: begin                             // static bit op
             if (!eaok(ir_m, ir_r, (IR[7:6] == 2'b00) ? M_DATA_NI : M_DALT)) `ILLEGAL
@@ -1074,14 +1207,14 @@ always_ff @(posedge clk) begin
         16'b0100_1110_0101_0???: state <= S_LINK0;                 // LINK.W
         16'b0100_1000_0000_1???: state <= S_LINKL;                 // LINK.L
         16'b0100_1110_0101_1???: begin                             // UNLK
-            `WR_A(3'd7, R[{1'b1, ir_r}])
-            `MEMRD(R[{1'b1, ir_r}], SZ_L, S_UNLK1)
+            `WR_SP(rB)
+            `MEMRD(rB, SZ_L, S_UNLK1)
         end
         16'b0100_1110_0110_????: begin                             // MOVE USP
             if (!sr[13]) `PRIV
             else begin
-                if (IR[3]) begin `WR_A(ir_r, usp) end
-                else usp <= R[{1'b1, ir_r}];
+                if (IR[3]) `WR_A(ir_r, rC)
+                else       `RFW(P_USP, rB, SZ_L)
                 state <= S_END;
             end
         end
@@ -1094,31 +1227,31 @@ always_ff @(posedge clk) begin
             else `CALL_EA(ir_m, ir_r, SZ_L, S_JEA)
         end
         16'b0100_1000_0100_0???: begin                             // SWAP
-            D[ir_r] <= {D[ir_r][15:0], D[ir_r][31:16]};
-            sr[3] <= D[ir_r][15];
-            sr[2] <= (D[ir_r] == 32'd0);
+            `WR_D(ir_r, {rB[15:0], rB[31:16]}, SZ_L)
+            sr[3] <= rB[15];
+            sr[2] <= (rB == 32'd0);
             sr[1:0] <= 2'b00;
             state <= S_END;
         end
         16'b0100_1000_0100_1???: `ILLEGAL                          // BKPT (no debugger)
         16'b0100_1000_1000_0???: begin                             // EXT.W
-            D[ir_r][15:0] <= {{8{D[ir_r][7]}}, D[ir_r][7:0]};
-            sr[3] <= D[ir_r][7];
-            sr[2] <= (D[ir_r][7:0] == 8'd0);
+            `WR_D(ir_r, sx8(rB[7:0]), SZ_W)
+            sr[3] <= rB[7];
+            sr[2] <= (rB[7:0] == 8'd0);
             sr[1:0] <= 2'b00;
             state <= S_END;
         end
         16'b0100_1000_1100_0???: begin                             // EXT.L
-            D[ir_r] <= sx16(D[ir_r][15:0]);
-            sr[3] <= D[ir_r][15];
-            sr[2] <= (D[ir_r][15:0] == 16'd0);
+            `WR_D(ir_r, sx16(rB[15:0]), SZ_L)
+            sr[3] <= rB[15];
+            sr[2] <= (rB[15:0] == 16'd0);
             sr[1:0] <= 2'b00;
             state <= S_END;
         end
         16'b0100_1001_1100_0???: begin                             // EXTB.L
-            D[ir_r] <= sx8(D[ir_r][7:0]);
-            sr[3] <= D[ir_r][7];
-            sr[2] <= (D[ir_r][7:0] == 8'd0);
+            `WR_D(ir_r, sx8(rB[7:0]), SZ_L)
+            sr[3] <= rB[7];
+            sr[2] <= (rB[7:0] == 8'd0);
             sr[1:0] <= 2'b00;
             state <= S_END;
         end
@@ -1227,7 +1360,7 @@ always_ff @(posedge clk) begin
 
         // -------------------------------------------------------------- line 7
         16'b0111_???0_????_????: begin                             // MOVEQ
-            D[ir_x] <= sx8(IR[7:0]);
+            `WR_D(ir_x, sx8(IR[7:0]), SZ_L)
             sr[3] <= IR[7];
             sr[2] <= (IR[7:0] == 8'd0);
             sr[1:0] <= 2'b00;
@@ -1253,7 +1386,7 @@ always_ff @(posedge clk) begin
                 else begin aop <= A_OR; g_dsel <= 2'd1; dst_reg <= ir_x; state <= G_SRC; end
             end else begin
                 if (!eaok(ir_m, ir_r, M_MALT)) `ILLEGAL
-                else begin aop <= A_OR; g_src_ea <= 1'b0; src <= D[ir_x]; state <= G_DST; end
+                else begin aop <= A_OR; g_src_ea <= 1'b0; src <= rA; state <= G_DST; end
             end
         end
 
@@ -1278,7 +1411,7 @@ always_ff @(posedge clk) begin
                 else begin aop <= IR[14] ? A_ADD : A_SUB; g_dsel <= 2'd1; dst_reg <= ir_x; state <= G_SRC; end
             end else begin
                 if (!eaok(ir_m, ir_r, M_MALT)) `ILLEGAL
-                else begin aop <= IR[14] ? A_ADD : A_SUB; g_src_ea <= 1'b0; src <= D[ir_x]; state <= G_DST; end
+                else begin aop <= IR[14] ? A_ADD : A_SUB; g_src_ea <= 1'b0; src <= rA; state <= G_DST; end
             end
         end
 
@@ -1296,7 +1429,7 @@ always_ff @(posedge clk) begin
         end
         16'b1011_???1_????_????: begin                             // EOR
             if (!eaok(ir_m, ir_r, M_DALT)) `ILLEGAL
-            else begin aop <= A_EOR; g_src_ea <= 1'b0; src <= D[ir_x]; state <= G_DST; end
+            else begin aop <= A_EOR; g_src_ea <= 1'b0; src <= rA; state <= G_DST; end
         end
         16'b1011_???0_????_????: begin                             // CMP
             if (!eaok(ir_m, ir_r, (ir_sz == SZ_B) ? M_DATA : M_ALL)) `ILLEGAL
@@ -1314,18 +1447,11 @@ always_ff @(posedge clk) begin
             src_reg <= ir_r; dst_reg <= ir_x;
             state <= G_SRC;
         end
-        16'b1100_???1_0100_0???: begin                             // EXG Dx,Dy
-            D[ir_x] <= D[ir_r]; D[ir_r] <= D[ir_x]; state <= S_END;
-        end
-        16'b1100_???1_0100_1???: begin                             // EXG Ax,Ay
-            `WR_A(ir_x, R[{1'b1, ir_r}])
-            `WR_A(ir_r, R[{1'b1, ir_x}])
-            state <= S_END;
-        end
-        16'b1100_???1_1000_1???: begin                             // EXG Dx,Ay
-            D[ir_x] <= R[{1'b1, ir_r}];
-            `WR_A(ir_r, D[ir_x])
-            state <= S_END;
+        16'b1100_???1_0100_0???, 16'b1100_???1_0100_1???, 16'b1100_???1_1000_1???: begin   // EXG
+            // first half: Rx <= Ry, keep old Rx for the second half
+            `RFW(ph({xa_dec, ir_x}, sp_ph), rB, SZ_L)
+            tmp <= rA;
+            state <= S_EXG2;
         end
         16'b1100_????_????_????: begin                             // AND
             if (!IR[8]) begin
@@ -1333,7 +1459,7 @@ always_ff @(posedge clk) begin
                 else begin aop <= A_AND; g_dsel <= 2'd1; dst_reg <= ir_x; state <= G_SRC; end
             end else begin
                 if (!eaok(ir_m, ir_r, M_MALT)) `ILLEGAL
-                else begin aop <= A_AND; g_src_ea <= 1'b0; src <= D[ir_x]; state <= G_DST; end
+                else begin aop <= A_AND; g_src_ea <= 1'b0; src <= rA; state <= G_DST; end
             end
         end
 
@@ -1348,8 +1474,8 @@ always_ff @(posedge clk) begin
             else begin sz <= SZ_W; g_src_ea <= 1'b0; g_after_dst <= S_SHIFTM; state <= G_DST; end
         end
         16'b1110_????_????_????: begin                             // register shift
-            tmp <= D[ir_r];
-            cnt6 <= sh_cnt;
+            tmp  <= rB;
+            cnt6 <= sh_cnt_dec;
             state <= S_SHIFT;
         end
 
@@ -1359,6 +1485,11 @@ always_ff @(posedge clk) begin
 
         default: `ILLEGAL
         endcase
+    end
+
+    S_EXG2: begin
+        `RFW(ph({ya_dec, ir_r}, sp_ph), tmp, SZ_L)
+        state <= S_END;
     end
 
     // =========================================================================
@@ -1383,7 +1514,7 @@ always_ff @(posedge clk) begin
     end
 
     // =========================================================================
-    // MOVEM
+    // MOVEM   (port A = An / register being transferred)
     // =========================================================================
     S_MOVEM0: begin
         if (!iw_hit) `NEED_IW(S_MOVEM0)
@@ -1391,11 +1522,11 @@ always_ff @(posedge clk) begin
             PC <= PC + 32'd2;
             mvm_mask <= iw;
             if (ir_m == 3'd4) begin               // -(An), reg -> mem
-                mvm_addr <= R[{1'b1, ir_r}];
-                tmp      <= R[{1'b1, ir_r}] - szbytes(sz);  // value stored for An itself (68020)
+                mvm_addr <= rA;
+                tmp      <= rA - szbytes(sz);     // value stored for An itself (68020)
                 state    <= S_MOVEM_PD;
             end else if (ir_m == 3'd3) begin      // (An)+, mem -> reg
-                mvm_addr <= R[{1'b1, ir_r}];
+                mvm_addr <= rA;
                 state    <= S_MOVEM_L;
             end else
                 `CALL_EA(ir_m, ir_r, sz, S_MOVEM1)
@@ -1414,7 +1545,7 @@ always_ff @(posedge clk) begin
             mvm_mask[lsb16(mvm_mask)] <= 1'b0;
             mvm_addr <= mvm_addr + szbytes(sz);
             if (IR[10]) `MEMRD(mvm_addr, sz, S_MOVEM_LD)
-            else        `MEMWR(mvm_addr, sz, R[lsb16(mvm_mask)], S_MOVEM_L)
+            else        `MEMWR(mvm_addr, sz, rA, S_MOVEM_L)
         end
     end
     S_MOVEM_LD: begin
@@ -1431,29 +1562,36 @@ always_ff @(posedge clk) begin
             if ((4'd15 - lsb16(mvm_mask)) == {1'b1, ir_r})
                 `MEMWR(mvm_addr - szbytes(sz), sz, tmp, S_MOVEM_PD)
             else
-                `MEMWR(mvm_addr - szbytes(sz), sz, R[4'd15 - lsb16(mvm_mask)], S_MOVEM_PD)
+                `MEMWR(mvm_addr - szbytes(sz), sz, rA, S_MOVEM_PD)
         end
     end
 
     // =========================================================================
-    // MOVEP
+    // MOVEP   (S_MOVEP0: port A = Ay; S_MOVEP2 first pass: port A = Dx)
     // =========================================================================
     S_MOVEP0: begin
         if (!iw_hit) `NEED_IW(S_MOVEP0)
         else begin
             PC <= PC + 32'd2;
-            mvm_addr <= R[{1'b1, ir_r}] + sx16(iw);
+            mvm_addr <= rA + sx16(iw);
             cnt3 <= IR[6] ? 3'd4 : 3'd2;
-            tmp  <= IR[6] ? D[ir_x] : {D[ir_x][15:0], 16'd0};
-            state <= S_MOVEP1;
+            tmp  <= 32'd0;
+            cnt6 <= 6'd1;
+            state <= S_MOVEP2;
         end
+    end
+    S_MOVEP2: begin
+        if (cnt6 == 6'd1) begin
+            cnt6 <= 6'd0;
+            if (IR[7]) tmp <= IR[6] ? rA : {rA[15:0], 16'd0};
+        end else begin
+            tmp <= {tmp[23:0], mem_rd[7:0]};
+        end
+        state <= S_MOVEP1;
     end
     S_MOVEP1: begin
         if (cnt3 == 3'd0) begin
-            if (!IR[7]) begin
-                if (IR[6]) D[ir_x] <= tmp;
-                else       D[ir_x][15:0] <= tmp[15:0];
-            end
+            if (!IR[7]) `WR_D(ir_x, tmp, IR[6] ? SZ_L : SZ_W)
             state <= S_END;
         end else begin
             cnt3 <= cnt3 - 3'd1;
@@ -1464,10 +1602,6 @@ always_ff @(posedge clk) begin
             end else
                 `MEMRD(mvm_addr, SZ_B, S_MOVEP2)
         end
-    end
-    S_MOVEP2: begin
-        tmp <= {tmp[23:0], mem_rd[7:0]};
-        state <= S_MOVEP1;
     end
 
     // =========================================================================
@@ -1512,8 +1646,8 @@ always_ff @(posedge clk) begin
         else begin
             PC <= PC + 32'd2;
             if (!cond(IR[11:8], sr[4:0])) begin
-                D[ir_r][15:0] <= D[ir_r][15:0] - 16'd1;
-                if (D[ir_r][15:0] != 16'd0) begin
+                `WR_D(ir_r, {16'd0, rA[15:0] - 16'd1}, SZ_W)
+                if (rA[15:0] != 16'd0) begin
                     PC <= PCi + 32'd2 + sx16(iw);
                     flow <= 1'b1;
                 end
@@ -1573,20 +1707,27 @@ always_ff @(posedge clk) begin
     end
     S_LINK1: begin
         // LINK A7 stores the already-decremented stack pointer
-        `PUSHL((ir_r == 3'd7) ? sp - 32'd4 : R[{1'b1, ir_r}], S_LINK2)
+        `PUSHL((ir_r == 3'd7) ? sp - 32'd4 : rA, (ir_r == 3'd7) ? S_LINK3 : S_LINK2)
     end
     S_LINK2: begin
-        if (ir_r != 3'd7) A[ir_r] <= sp;
-        `WR_A(3'd7, sp + bdisp)
+        `WR_A(ir_r, sp)
+        state <= S_LINK3;
+    end
+    S_LINK3: begin
+        `WR_SP(sp + bdisp)
         state <= S_END;
     end
     S_UNLK1: begin
         if (ir_r == 3'd7) begin
-            `WR_A(3'd7, mem_rd)
+            `WR_SP(mem_rd)
+            state <= S_END;
         end else begin
-            A[ir_r] <= mem_rd;
-            `WR_A(3'd7, sp + 32'd4)
+            `WR_A(ir_r, mem_rd)
+            state <= S_UNLK2;
         end
+    end
+    S_UNLK2: begin
+        `WR_SP(sp + 32'd4)
         state <= S_END;
     end
 
@@ -1595,7 +1736,7 @@ always_ff @(posedge clk) begin
     // =========================================================================
     S_RTS1: begin
         PC <= mem_rd;
-        `WR_A(3'd7, sp + 32'd4)
+        `WR_SP(sp + 32'd4)
         flow <= 1'b1;
         state <= S_END;
     end
@@ -1609,7 +1750,7 @@ always_ff @(posedge clk) begin
     end
     S_RTD1: begin
         PC <= mem_rd;
-        `WR_A(3'd7, sp + 32'd4 + bdisp)
+        `WR_SP(sp + 32'd4 + bdisp)
         flow <= 1'b1;
         state <= S_END;
     end
@@ -1619,7 +1760,7 @@ always_ff @(posedge clk) begin
     end
     S_RTR2: begin
         PC <= mem_rd;
-        `WR_A(3'd7, sp + 32'd6)
+        `WR_SP(sp + 32'd6)
         flow <= 1'b1;
         state <= S_END;
     end
@@ -1640,11 +1781,11 @@ always_ff @(posedge clk) begin
     end
     S_RTE3: begin
         case (mem_rd[15:12])
-            4'h0, 4'h1: begin `WR_A(3'd7, sp + 32'd8)  state <= S_RTE4; end
-            4'h2:       begin `WR_A(3'd7, sp + 32'd12) state <= S_RTE4; end
-            4'h9:       begin `WR_A(3'd7, sp + 32'd20) state <= S_RTE4; end
-            4'hA:       begin `WR_A(3'd7, sp + 32'd32) state <= S_RTE4; end
-            4'hB:       begin `WR_A(3'd7, sp + 32'd92) state <= S_RTE4; end
+            4'h0, 4'h1: begin `WR_SP(sp + 32'd8)  state <= S_RTE4; end
+            4'h2:       begin `WR_SP(sp + 32'd12) state <= S_RTE4; end
+            4'h9:       begin `WR_SP(sp + 32'd20) state <= S_RTE4; end
+            4'hA:       begin `WR_SP(sp + 32'd32) state <= S_RTE4; end
+            4'hB:       begin `WR_SP(sp + 32'd92) state <= S_RTE4; end
             default:    `EXC(8'd14, 4'h0, PCi, PCi)
         endcase
         cnt3 <= {2'd0, mem_rd[15:12] == 4'h1};
@@ -1660,21 +1801,33 @@ always_ff @(posedge clk) begin
     end
 
     // =========================================================================
-    // CHK / CHK2 / CMP2
+    // CHK (src = upper bound, port A = Dn); compare through the shared ALU
     // =========================================================================
     S_CHK: begin
-        // src = upper bound, compare Dn (sized, signed)
-        if ($signed(sxs(D[ir_x], sz)) < 0) begin
+        dst  <= sxs(rA, sz);
+        src  <= sxs(src, sz);
+        sz   <= SZ_L;
+        aop  <= A_CMP;
+        sext_src <= 1'b0;
+        state <= S_CHK1;
+    end
+    S_CHK1: begin
+        // dst = Dn, src = bound (both sign-extended): Dn > bound  <=>  GT
+        sr[2] <= (dst == 32'd0);
+        sr[1:0] <= 2'b00;
+        if (dst[31]) begin
             sr[3] <= 1'b1;
             `EXCT(8'd6, 4'h2, PC, PCi)
-        end else if ($signed(sxs(D[ir_x], sz)) > $signed(sxs(src, sz))) begin
+        end else if (!alu_z && (alu_n == alu_v)) begin
             sr[3] <= 1'b0;
             `EXCT(8'd6, 4'h2, PC, PCi)
         end else
             state <= S_END;
-        sr[2] <= (zxs(D[ir_x], sz) == 32'd0);
-        sr[1:0] <= 2'b00;
     end
+
+    // =========================================================================
+    // CHK2 / CMP2  (three compares through the shared ALU)
+    // =========================================================================
     S_CHK2X: begin
         if (!iw_hit) `NEED_IW(S_CHK2X)
         else begin
@@ -1690,33 +1843,48 @@ always_ff @(posedge clk) begin
         src <= sxs(mem_rd, sz);                    // lower bound
         `MEMRD(ea_addr + szbytes(sz), sz, S_CHK2R2)
     end
-    S_CHK2R2: begin : chk2_blk
-        logic [31:0] lo, hi, rv;
-        logic        out;
-        lo = src;
-        hi = sxs(mem_rd, sz);
-        rv = ext[15] ? R[ext[15:12]] : sxs(R[ext[15:12]], sz);
-        out = ($signed(lo) <= $signed(hi)) ? ($signed(rv) < $signed(lo) || $signed(rv) > $signed(hi))
-                                           : ($signed(rv) > $signed(hi) && $signed(rv) < $signed(lo));
-        sr[2] <= (rv == lo) || (rv == hi);
+    S_CHK2R2: begin
+        // compare 1: upper - lower  (lower <= upper  <=> GE)
+        dst <= sxs(mem_rd, sz);
+        tmp <= sxs(mem_rd, sz);                    // keep upper bound
+        tmp2 <= ext[15] ? rA : sxs(rA, sz);        // value being checked
+        sz  <= SZ_L;
+        aop <= A_CMP;
+        sext_src <= 1'b0;
+        state <= S_CHK2C1;
+    end
+    S_CHK2C1: begin
+        flg[0] <= (alu_n == alu_v);                // lower <= upper
+        dst <= tmp2;                               // compare 2: rv - lower
+        state <= S_CHK2C2;
+    end
+    S_CHK2C2: begin
+        flg[1] <= (alu_n != alu_v);                // rv < lower
+        sr[2]  <= alu_z;                           // rv == lower
+        src <= tmp;                                // compare 3: rv - upper
+        state <= S_CHK2C3;
+    end
+    S_CHK2C3: begin : chk2_blk
+        logic gt, out;
+        gt  = !alu_z && (alu_n == alu_v);          // rv > upper
+        out = flg[0] ? (flg[1] || gt) : (flg[1] && gt);
+        if (alu_z) sr[2] <= 1'b1;
         sr[0] <= out;
         if (out && ext[11]) `EXCT(8'd6, 4'h2, PC, PCi)
         else state <= S_END;
     end
 
     // =========================================================================
-    // MUL
+    // MUL: 32x32 -> 64 from four 16x16 products (+ signed corrections)
     // =========================================================================
     S_MULW: begin
-        // 16x16 -> 32 (single multiplier pass)
         md_signed <= IR[8];
-        md_a <= IR[8] ? (src[15] ? {16'd0, -src[15:0]} : {16'd0, src[15:0]}) : {16'd0, src[15:0]};
-        md_b <= IR[8] ? (D[ir_x][15] ? {16'd0, -D[ir_x][15:0]} : {16'd0, D[ir_x][15:0]}) : {16'd0, D[ir_x][15:0]};
-        md_neg <= IR[8] && (src[15] ^ D[ir_x][15]);
+        md_a <= IR[8] ? sx16(src[15:0]) : {16'd0, src[15:0]};
+        md_b <= IR[8] ? sx16(rA[15:0])  : {16'd0, rA[15:0]};
         md_word <= 1'b1;
         md_long64 <= 1'b0;
         md_acc <= 64'd0;
-        md_step <= 2'd0;
+        md_step <= 3'd0;
         state <= S_MUL_LOOP;
     end
     S_MULLX: begin
@@ -1730,67 +1898,54 @@ always_ff @(posedge clk) begin
     end
     S_MULL: begin
         md_signed <= ext[11];
-        md_a <= (ext[11] && src[31]) ? -src : src;
-        md_b <= (ext[11] && D[ext[14:12]][31]) ? -D[ext[14:12]] : D[ext[14:12]];
-        md_neg <= ext[11] && (src[31] ^ D[ext[14:12]][31]);
+        md_a <= src;
+        md_b <= rA;
         md_word <= 1'b0;
         md_long64 <= ext[10];
         md_acc <= 64'd0;
-        md_step <= 2'd0;
+        md_step <= 3'd0;
         state <= S_MUL_LOOP;
     end
     S_MUL_LOOP: begin
-        // one 16x16 partial product per pass (product registered through mul_x/mul_y)
         case (md_step)
-            2'd0: begin mul_x <= md_a[15:0];  mul_y <= md_b[15:0];  end
-            2'd1: begin mul_x <= md_a[31:16]; mul_y <= md_b[15:0];  end
-            2'd2: begin mul_x <= md_a[15:0];  mul_y <= md_b[31:16]; end
-            default: begin mul_x <= md_a[31:16]; mul_y <= md_b[31:16]; end
+            3'd0: begin mul_x <= md_a[15:0];  mul_y <= md_b[15:0];  end
+            3'd1: begin mul_x <= md_a[31:16]; mul_y <= md_b[15:0];  end
+            3'd2: begin mul_x <= md_a[15:0];  mul_y <= md_b[31:16]; end
+            3'd3: begin mul_x <= md_a[31:16]; mul_y <= md_b[31:16]; end
+            default: ;
         endcase
-        cnt3 <= {1'b0, md_step};
-        md_step <= md_step + 2'd1;
-        if (md_step != 2'd0) begin
-            // accumulate previous product
-            case (cnt3[1:0])
-                2'd0: md_acc <= md_acc + {32'd0, mul_p};
-                2'd1, 2'd2: md_acc <= md_acc + {16'd0, mul_p, 16'd0};
-                default: md_acc <= md_acc + {mul_p, 32'd0};
-            endcase
-        end
-        if (md_word || md_step == 2'd3) state <= S_MUL_FIN;
+        md_acc  <= md_sum;
+        md_step <= md_step + 3'd1;
+        if (md_step == 3'd6) state <= S_MUL_FIN;
     end
-    S_MUL_FIN: begin : mulfin
-        logic [63:0] p, acc;
-        // add the final outstanding product
-        case (cnt3[1:0])
-            2'd0: acc = md_acc + {32'd0, mul_p};
-            2'd1, 2'd2: acc = md_acc + {16'd0, mul_p, 16'd0};
-            default: acc = md_acc + {mul_p, 32'd0};
-        endcase
-        p = md_neg ? -acc : acc;
+    S_MUL_FIN: begin
         if (md_word) begin
-            D[ir_x] <= p[31:0];
-            sr[3] <= p[31];
-            sr[2] <= (p[31:0] == 32'd0);
+            `WR_D(ir_x, md_acc[31:0], SZ_L)
+            sr[3] <= md_acc[31];
+            sr[2] <= (md_acc[31:0] == 32'd0);
             sr[1:0] <= 2'b00;
+            state <= S_END;
         end else if (md_long64) begin
-            D[ext[2:0]] <= p[63:32];
-            D[ext[14:12]] <= p[31:0];
-            sr[3] <= p[63];
-            sr[2] <= (p == 64'd0);
+            `WR_D(ext[2:0], md_acc[63:32], SZ_L)
+            sr[3] <= md_acc[63];
+            sr[2] <= (md_acc == 64'd0);
             sr[1:0] <= 2'b00;
+            state <= S_MUL_FIN2;
         end else begin
-            D[ext[14:12]] <= p[31:0];
-            sr[3] <= p[31];
-            sr[2] <= (p[31:0] == 32'd0);
-            sr[1] <= md_signed ? (p[63:32] != {32{p[31]}}) : (p[63:32] != 32'd0);
+            sr[3] <= md_acc[31];
+            sr[2] <= (md_acc[31:0] == 32'd0);
+            sr[1] <= md_signed ? (md_acc[63:32] != {32{md_acc[31]}}) : (md_acc[63:32] != 32'd0);
             sr[0] <= 1'b0;
+            state <= S_MUL_FIN2;
         end
+    end
+    S_MUL_FIN2: begin
+        `WR_D(ext[14:12], md_acc[31:0], SZ_L)
         state <= S_END;
     end
 
     // =========================================================================
-    // DIV
+    // DIV: restoring division on magnitudes
     // =========================================================================
     S_DIVW: begin
         if (src[15:0] == 16'd0) begin
@@ -1800,13 +1955,12 @@ always_ff @(posedge clk) begin
             md_signed <= IR[8];
             md_word   <= 1'b1;
             md_long64 <= 1'b0;
-            // dividend magnitude in md_acc, divisor magnitude in md_b
-            md_acc <= {32'd0, (IR[8] && D[ir_x][31]) ? -D[ir_x] : D[ir_x]};
-            md_b   <= IR[8] ? (src[15] ? {16'd0, -src[15:0]} : {16'd0, src[15:0]}) : {16'd0, src[15:0]};
-            md_neg <= IR[8] && (D[ir_x][31] ^ src[15]);
-            md_rneg <= IR[8] && D[ir_x][31];
-            state <= S_DIV_LOOP;
-            md_cnt <= 6'd0;
+            md_acc  <= IR[8] ? {{32{rA[31]}}, rA} : {32'd0, rA};
+            md_b    <= IR[8] ? sx16(src[15:0]) : {16'd0, src[15:0]};
+            md_neg  <= IR[8] && (rA[31] ^ src[15]);
+            md_rneg <= IR[8] && rA[31];
+            md_bneg <= IR[8] && src[15];
+            state <= S_DIV_ABS1;
         end
     end
     S_DIVLX: begin
@@ -1820,29 +1974,36 @@ always_ff @(posedge clk) begin
     end
     S_DIVL: begin : divl_blk
         logic [63:0] dvd;
-        logic        dneg;
         if (src == 32'd0) begin
             sr[0] <= 1'b0;
             `EXCT(8'd5, 4'h2, PC, PCi)
         end else begin
-            dvd  = ext[10] ? {D[ext[2:0]], D[ext[14:12]]} : (ext[11] ? {{32{D[ext[14:12]][31]}}, D[ext[14:12]]} : {32'd0, D[ext[14:12]]});
-            dneg = ext[11] && dvd[63];
+            // port A = Dq, port B = Dr
+            dvd = ext[10] ? {rB, rA} : (ext[11] ? {{32{rA[31]}}, rA} : {32'd0, rA});
             md_signed <= ext[11];
             md_word   <= 1'b0;
             md_long64 <= ext[10];
-            md_acc <= dneg ? -dvd : dvd;
-            md_b   <= (ext[11] && src[31]) ? -src : src;
-            md_neg <= ext[11] && (dneg ^ src[31]);
-            md_rneg <= dneg;
-            md_cnt <= 6'd0;
-            state <= S_DIV_LOOP;
+            md_acc  <= dvd;
+            md_b    <= src;
+            md_neg  <= ext[11] && (dvd[63] ^ src[31]);
+            md_rneg <= ext[11] && dvd[63];
+            md_bneg <= ext[11] && src[31];
+            state <= S_DIV_ABS1;
         end
     end
-    S_DIV_LOOP: begin : divloop
-        logic [32:0] r2;
+    S_DIV_ABS1: begin
+        if (md_rneg) md_acc <= md_sum;                       // |dividend|
+        state <= S_DIV_ABS2;
+    end
+    S_DIV_ABS2: begin
+        if (md_bneg) md_b <= md_sum[31:0];                   // |divisor|
+        md_cnt <= 6'd0;
+        state <= S_DIV_LOOP;
+    end
+    S_DIV_LOOP: begin
         if (md_cnt == 6'd0) begin
             // overflow pre-check: high half must be < divisor
-            if (md_acc[63:32] >= md_b) begin
+            if (!div_diff[33]) begin
                 sr[1] <= 1'b1; sr[0] <= 1'b0;
                 state <= S_END;
             end else begin
@@ -1851,13 +2012,11 @@ always_ff @(posedge clk) begin
                 md_cnt <= 6'd1;
             end
         end else begin
-            // restoring division step: shift in next dividend bit (held in md_q MSB)
-            r2 = {md_rem[31:0], md_q[31]};
-            if (r2 >= {1'b0, md_b}) begin
-                md_rem <= r2 - {1'b0, md_b};
+            if (!div_diff[33]) begin
+                md_rem <= div_diff[32:0];
                 md_q   <= {md_q[30:0], 1'b1};
             end else begin
-                md_rem <= r2;
+                md_rem <= div_r2;
                 md_q   <= {md_q[30:0], 1'b0};
             end
             md_cnt <= md_cnt + 6'd1;
@@ -1865,29 +2024,32 @@ always_ff @(posedge clk) begin
         end
     end
     S_DIV_FIN: begin : divfin
-        logic [31:0] q, r;
-        logic        ovf;
-        q = md_neg ? -md_q : md_q;
-        r = md_rneg ? -md_rem[31:0] : md_rem[31:0];
+        logic ovf;
         if (md_word)
             ovf = md_signed ? (md_neg ? (md_q > 32'h8000) : (md_q > 32'h7FFF)) : (md_q > 32'hFFFF);
         else
             ovf = md_signed ? (md_neg ? (md_q > 32'h8000_0000) : (md_q > 32'h7FFF_FFFF)) : 1'b0;
         sr[0] <= 1'b0;
+        tmp <= md_sum[31:0];                       // signed remainder
         if (ovf) begin
             sr[1] <= 1'b1;
+            state <= S_END;
         end else begin
             sr[1] <= 1'b0;
-            if (md_word) begin
-                D[ir_x] <= {r[15:0], q[15:0]};
-                sr[3] <= q[15];
-                sr[2] <= (q[15:0] == 16'd0);
-            end else begin
-                if (md_long64 || ext[2:0] != ext[14:12]) D[ext[2:0]] <= r;
-                D[ext[14:12]] <= q;
-                sr[3] <= q[31];
-                sr[2] <= (q == 32'd0);
-            end
+            if (!md_word && (md_long64 || ext[2:0] != ext[14:12]))
+                `WR_D(ext[2:0], md_sum[31:0], SZ_L)
+            state <= S_DIV_FIN2;
+        end
+    end
+    S_DIV_FIN2: begin
+        if (md_word) begin
+            `WR_D(ir_x, {tmp[15:0], md_sum[15:0]}, SZ_L)
+            sr[3] <= md_sum[15];
+            sr[2] <= (md_sum[15:0] == 16'd0);
+        end else begin
+            `WR_D(ext[14:12], md_sum[31:0], SZ_L)
+            sr[3] <= md_sum[31];
+            sr[2] <= (md_sum[31:0] == 32'd0);
         end
         state <= S_END;
     end
@@ -1895,8 +2057,7 @@ always_ff @(posedge clk) begin
     // =========================================================================
     // shifts / rotates
     // =========================================================================
-    S_SHIFT: begin : shift_blk
-        logic [36:0] so;
+    S_SHIFT: begin
         if (IR[4:3] == 2'b10) begin
             // ROXL / ROXR : iterative
             case (ir_sz)
@@ -1908,15 +2069,14 @@ always_ff @(posedge clk) begin
             sr[0] <= sr[4];
             state <= S_ROX;
         end else begin
-            so = shifter(IR[4:3], IR[8], ir_sz, cnt6, tmp, sr[4:0]);
-            D[ir_r] <= merge(D[ir_r], so[31:0], ir_sz);
-            sr[4:0] <= so[36:32];
+            `WR_D(ir_r, sh_o[31:0], ir_sz)
+            sr[4:0] <= sh_o[36:32];
             state <= S_END;
         end
     end
     S_ROX: begin
         if (cnt6 == 6'd0) begin
-            D[ir_r] <= merge(D[ir_r], tmp, sz);
+            `WR_D(ir_r, tmp, sz)
             sr[3] <= msbs(tmp, sz);
             sr[2] <= (zxs(tmp, sz) == 32'd0);
             sr[1] <= 1'b0;
@@ -1938,7 +2098,6 @@ always_ff @(posedge clk) begin
         end
     end
     S_SHIFTM: begin : shiftm_blk
-        logic [36:0] so;
         logic [31:0] v;
         if (IR[10:9] == 2'b10) begin
             // ROXL/ROXR #1 word
@@ -1950,9 +2109,8 @@ always_ff @(posedge clk) begin
             sr[2] <= (v[15:0] == 16'd0);
             sr[1] <= 1'b0;
         end else begin
-            so = shifter(IR[10:9], IR[8], SZ_W, 6'd1, dst, sr[4:0]);
-            res <= so[31:0];
-            sr[4:0] <= so[36:32];
+            res <= sh_o[31:0];
+            sr[4:0] <= sh_o[36:32];
         end
         state <= G_WB;
     end
@@ -2001,48 +2159,18 @@ always_ff @(posedge clk) begin
         end
     end
     S_BFE: begin
-        bf_off <= ext[11] ? D[ext[8:6]] : {27'd0, ext[10:6]};
-        bf_w   <= ext[5] ? ((D[ext[2:0]][4:0] == 5'd0) ? 6'd32 : {1'b0, D[ext[2:0]][4:0]})
+        // port A = D[ext[8:6]] (offset), port B = D[ext[2:0]] (width)
+        bf_off <= ext[11] ? rA : {27'd0, ext[10:6]};
+        bf_w   <= ext[5] ? ((rB[4:0] == 5'd0) ? 6'd32 : {1'b0, rB[4:0]})
                          : ((ext[4:0] == 5'd0) ? 6'd32 : {1'b0, ext[4:0]});
+        bf_reg <= (ea_kind == K_D);
         state  <= S_BF0;
     end
-    S_BF0: begin : bf0_blk
-        logic [31:0] rot, nrot, ins, fld;
-        logic [5:0]  i;
-        logic        found;
-        if (ea_kind == K_D) begin
-            rot = bf_rot64[63:32];
-            fld = rot & bf_w32;
-            ins = D[ext[14:12]] << (6'd32 - bf_w);
-            sr[3] <= rot[31];
-            sr[2] <= (fld == 32'd0);
-            sr[1:0] <= 2'b00;
-            case (IR[10:8])
-                3'b010: nrot = rot ^ bf_w32;                       // BFCHG
-                3'b100: nrot = rot & ~bf_w32;                      // BFCLR
-                3'b110: nrot = rot | bf_w32;                       // BFSET
-                3'b111: begin                                      // BFINS
-                    nrot = (rot & ~bf_w32) | (ins & bf_w32);
-                    sr[3] <= ins[31];
-                    sr[2] <= ((ins & bf_w32) == 32'd0);
-                end
-                default: nrot = rot;
-            endcase
-            if (IR[10:8] == 3'b010 || IR[10:8] == 3'b100 || IR[10:8] == 3'b110 || IR[10:8] == 3'b111)
-                D[ir_r] <= ({nrot, nrot} >> bf_ro) ;   // rotate right back
-            // extract / find first one
-            case (IR[10:8])
-                3'b001: D[ext[14:12]] <= fld >> (6'd32 - bf_w);                       // BFEXTU
-                3'b011: D[ext[14:12]] <= $signed(fld) >>> (6'd32 - bf_w);             // BFEXTS
-                3'b101: begin                                                           // BFFFO
-                    found = 1'b0; i = bf_w;
-                    for (int k = 31; k >= 0; k--)
-                        if (!found && fld[k]) begin found = 1'b1; i = 6'd31 - k[5:0]; end
-                    D[ext[14:12]] <= {27'd0, bf_off[4:0]} + {26'd0, i};
-                end
-                default: ;
-            endcase
-            state <= S_END;
+    S_BF0: begin
+        if (bf_reg) begin
+            // register: rotate the field to the top (shifter: ROL Dn, offset)
+            bf_buf <= {sh_o[31:0], 8'd0};
+            state  <= S_BF3;
         end else begin
             // bytes touched: 1 -> byte, 2 -> word, 3 -> word+byte, 4 -> long, 5 -> long+byte
             bf_addr <= ea_addr + {{3{bf_off[31]}}, bf_off[31:3]};
@@ -2067,60 +2195,44 @@ always_ff @(posedge clk) begin
         else               bf_buf[7:0]   <= mem_rd[7:0];
         state <= S_BF3;
     end
-    S_BF3: begin : bf3_blk
-        logic [39:0] sh, msk, nb, insv;
-        logic [31:0] fld, ins;
-        logic [5:0]  i;
-        logic        found;
-        sh  = bf_buf << bf_off[2:0];
-        fld = sh[39:8] & bf_w32;
-        msk = {bf_w32, 8'd0} >> bf_off[2:0];
-        ins = D[ext[14:12]] << (6'd32 - bf_w);
-        insv = {ins & bf_w32, 8'd0} >> bf_off[2:0];
-        sr[3] <= sh[39];
-        sr[2] <= (fld == 32'd0);
+    S_BF3: begin
+        sr[3] <= bf_al[39];
+        sr[2] <= (bf_fld == 32'd0);
         sr[1:0] <= 2'b00;
+        if (IR[10:8] == 3'b111) begin
+            sr[3] <= bf_ins[31];
+            sr[2] <= ((bf_ins & bf_w32) == 32'd0);
+        end
+        bf_buf <= bf_nb;
         case (IR[10:8])
-            3'b010: nb = bf_buf ^ msk;
-            3'b100: nb = bf_buf & ~msk;
-            3'b110: nb = bf_buf | msk;
-            3'b111: begin
-                nb = (bf_buf & ~msk) | insv;
-                sr[3] <= ins[31];
-                sr[2] <= ((ins & bf_w32) == 32'd0);
-            end
-            default: nb = bf_buf;
-        endcase
-        bf_buf <= nb;
-        case (IR[10:8])
-            3'b001: D[ext[14:12]] <= fld >> (6'd32 - bf_w);
-            3'b011: D[ext[14:12]] <= $signed(fld) >>> (6'd32 - bf_w);
-            3'b101: begin
-                found = 1'b0; i = bf_w;
-                for (int k = 31; k >= 0; k--)
-                    if (!found && fld[k]) begin found = 1'b1; i = 6'd31 - k[5:0]; end
-                D[ext[14:12]] <= bf_off + {26'd0, i};
-            end
+            3'b001, 3'b011: `WR_D(ext[14:12], bf_extv[31:0], SZ_L)          // BFEXTU / BFEXTS
+            3'b101: `WR_D(ext[14:12], (bf_reg ? {27'd0, bf_off[4:0]} : bf_off) + {26'd0, bf_ffo}, SZ_L)  // BFFFO
             default: ;
         endcase
-        if (IR[10:8] == 3'b010 || IR[10:8] == 3'b100 || IR[10:8] == 3'b110 || IR[10:8] == 3'b111) begin
+        if (!bf_modify) state <= S_END;
+        else if (bf_reg) state <= S_BF5;
+        else begin
             case (bf_bc)
-                3'd1:       `MEMWR(bf_addr, SZ_B, {24'd0, nb[39:32]}, S_END)
-                3'd2:       `MEMWR(bf_addr, SZ_W, {16'd0, nb[39:24]}, S_END)
-                3'd3:       `MEMWR(bf_addr, SZ_W, {16'd0, nb[39:24]}, S_BF4)
-                3'd4:       `MEMWR(bf_addr, SZ_L, nb[39:8], S_END)
-                default:    `MEMWR(bf_addr, SZ_L, nb[39:8], S_BF4)
+                3'd1:       `MEMWR(bf_addr, SZ_B, {24'd0, bf_nb[39:32]}, S_END)
+                3'd2:       `MEMWR(bf_addr, SZ_W, {16'd0, bf_nb[39:24]}, S_END)
+                3'd3:       `MEMWR(bf_addr, SZ_W, {16'd0, bf_nb[39:24]}, S_BF4)
+                3'd4:       `MEMWR(bf_addr, SZ_L, bf_nb[39:8], S_END)
+                default:    `MEMWR(bf_addr, SZ_L, bf_nb[39:8], S_BF4)
             endcase
-        end else
-            state <= S_END;
+        end
     end
     S_BF4: begin
         if (bf_bc == 3'd3) `MEMWR(bf_addr + 32'd2, SZ_B, {24'd0, bf_buf[23:16]}, S_END)
         else               `MEMWR(bf_addr + 32'd4, SZ_B, {24'd0, bf_buf[7:0]}, S_END)
     end
+    S_BF5: begin
+        // register: rotate back (shifter: ROR field, offset)
+        `WR_D(ir_r, sh_o[31:0], SZ_L)
+        state <= S_END;
+    end
 
     // =========================================================================
-    // CAS / CAS2
+    // CAS / CAS2  (compares through the shared ALU)
     // =========================================================================
     S_CASX: begin
         if (!iw_hit) `NEED_IW(S_CASX)
@@ -2134,13 +2246,18 @@ always_ff @(posedge clk) begin
     S_CASE: begin
         `MEMRD(ea_addr, sz, S_CAS)
     end
-    S_CAS: begin : cas_blk
-        logic [37:0] o;
-        o = alu(A_CMP, sz, D[ext[2:0]], mem_rd, sr[4:0], 1'b0);
-        sr[4:0] <= o[36:32];
-        if (o[34]) `MEMWR(ea_addr, sz, D[ext[8:6]], S_END)
+    S_CAS: begin
+        dst <= mem_rd;
+        src <= rA;                                   // Dc
+        aop <= A_CMP;
+        sext_src <= 1'b0;
+        state <= S_CAS1;
+    end
+    S_CAS1: begin
+        sr[4:0] <= alu_o[36:32];
+        if (alu_z) `MEMWR(ea_addr, sz, rB, S_END)    // Du
         else begin
-            D[ext[2:0]] <= merge(D[ext[2:0]], mem_rd, sz);
+            `WR_D(ext[2:0], dst, sz)
             state <= S_END;
         end
     end
@@ -2153,44 +2270,54 @@ always_ff @(posedge clk) begin
         else begin
             PC <= PC + 32'd2;
             ext2 <= iw;
-            `MEMRD(R[ext[15:12]], sz, S_CAS2R1)
+            `MEMRD(rA, sz, S_CAS2R1)                 // (Rn1)
         end
     end
     S_CAS2R1: begin
         tmp <= mem_rd;
-        `MEMRD(R[ext2[15:12]], sz, S_CAS2R2)
+        `MEMRD(rA, sz, S_CAS2R2)                     // (Rn2)
     end
     S_CAS2R2: begin
         tmp2 <= mem_rd;
-        state <= S_CAS2C;
+        aop <= A_CMP;
+        sext_src <= 1'b0;
+        state <= S_CAS2C1;
     end
-    S_CAS2C: begin : cas2_blk
-        logic [37:0] o1, o2;
-        o1 = alu(A_CMP, sz, D[ext[2:0]], tmp, sr[4:0], 1'b0);
-        o2 = alu(A_CMP, sz, D[ext2[2:0]], tmp2, sr[4:0], 1'b0);
-        if (!o1[34]) begin
-            sr[4:0] <= o1[36:32];
-            D[ext2[2:0]] <= merge(D[ext2[2:0]], tmp2, sz);
-            state <= S_CAS2W2;      // second register write (Dc1 wins)
-        end else if (!o2[34]) begin
-            sr[4:0] <= o2[36:32];
-            D[ext2[2:0]] <= merge(D[ext2[2:0]], tmp2, sz);
-            state <= S_CAS2W2;
-        end else begin
-            sr[4:0] <= o2[36:32];
-            `MEMWR(R[ext[15:12]], sz, D[ext[8:6]], S_CAS2W1)
+    S_CAS2C1: begin
+        src <= rA;                                   // Dc1
+        dst <= tmp;
+        state <= S_CAS2C2;
+    end
+    S_CAS2C2: begin
+        sr[4:0] <= alu_o[36:32];
+        if (!alu_z) state <= S_CAS2F1;
+        else begin
+            src <= rB;                               // Dc2
+            dst <= tmp2;
+            state <= S_CAS2C3;
         end
     end
+    S_CAS2C3: begin
+        sr[4:0] <= alu_o[36:32];
+        state <= alu_z ? S_CAS2W1 : S_CAS2F1;
+    end
     S_CAS2W1: begin
-        `MEMWR(R[ext2[15:12]], sz, D[ext2[8:6]], S_END)
+        `MEMWR(rA, sz, rB, S_CAS2W2)                 // Du1 -> (Rn1)
     end
     S_CAS2W2: begin
-        D[ext[2:0]] <= merge(D[ext[2:0]], tmp, sz);
+        `MEMWR(rA, sz, rB, S_END)                    // Du2 -> (Rn2)
+    end
+    S_CAS2F1: begin
+        `WR_D(ext2[2:0], tmp2, sz)
+        state <= S_CAS2F2;
+    end
+    S_CAS2F2: begin
+        `WR_D(ext[2:0], tmp, sz)                     // Dc1 wins if Dc1 == Dc2
         state <= S_END;
     end
 
     // =========================================================================
-    // PACK / UNPK  (also: EXG Ax,Ay second half)
+    // PACK / UNPK
     // =========================================================================
     S_PACKX: begin
         if (!iw_hit) `NEED_IW(S_PACKX)
@@ -2198,11 +2325,8 @@ always_ff @(posedge clk) begin
             PC <= PC + 32'd2;
             bdisp <= {16'd0, iw};
             if (!IR[3]) begin
-                if (!IR[7]) begin   // PACK Dx,Dy
-                    D[ir_x][7:0] <= pack_b(D[ir_r][15:0] + iw);
-                end else begin      // UNPK Dx,Dy
-                    D[ir_x][15:0] <= {4'd0, D[ir_r][7:4], 4'd0, D[ir_r][3:0]} + iw;
-                end
+                if (!IR[7]) `WR_D(ir_x, {24'd0, pack_b(rA[15:0] + iw)}, SZ_B)                          // PACK Dx,Dy
+                else        `WR_D(ir_x, {16'd0, {4'd0, rA[7:4], 4'd0, rA[3:0]} + iw}, SZ_W)            // UNPK Dx,Dy
                 state <= S_END;
             end else begin
                 `CALL_EA(3'd4, ir_r, SZ_B, IR[7] ? S_UNPKM1 : S_PACKM1)
@@ -2210,7 +2334,7 @@ always_ff @(posedge clk) begin
         end
     end
     S_PACKM1: begin
-        `MEMRD(ea_addr, SZ_B, S_PACKM2)          // low byte (higher address)
+        `MEMRD(ea_addr, SZ_B, S_PACKM2)
     end
     S_PACKM2: begin
         // first byte read (higher address) is the low byte of the unpacked word
@@ -2261,20 +2385,20 @@ always_ff @(posedge clk) begin
             PC <= PC + 32'd2;
             state <= S_END;
             if (IR[0]) begin
-                // Rn -> Rc
+                // Rn -> Rc  (port A = Rn)
                 case (iw[11:0])
-                    12'h000: sfc <= R[iw[15:12]][2:0];
-                    12'h001: dfc <= R[iw[15:12]][2:0];
+                    12'h000: sfc <= rA[2:0];
+                    12'h001: dfc <= rA[2:0];
                     12'h002: begin
-                        cacr <= {30'd0, R[iw[15:12]][1:0]};
-                        if (R[iw[15:12]][3]) ic_valid <= 64'd0;
-                        else if (R[iw[15:12]][2]) ic_valid[caar[7:2]] <= 1'b0;
+                        cacr <= {30'd0, rA[1:0]};
+                        if (rA[3]) ic_valid <= 64'd0;
+                        else if (rA[2]) ic_valid[caar[7:2]] <= 1'b0;
                     end
-                    12'h800: usp <= R[iw[15:12]];
-                    12'h801: vbr <= R[iw[15:12]];
-                    12'h802: caar <= R[iw[15:12]];
-                    12'h803: msp <= R[iw[15:12]];
-                    12'h804: isp <= R[iw[15:12]];
+                    12'h800: `RFW(P_USP, rA, SZ_L)
+                    12'h801: vbr <= rA;
+                    12'h802: caar <= rA;
+                    12'h803: `RFW(P_MSP, rA, SZ_L)
+                    12'h804: `RFW(P_ISP, rA, SZ_L)
                     default: `ILLEGAL
                 endcase
             end else begin
@@ -2296,12 +2420,12 @@ always_ff @(posedge clk) begin
         end
     end
     S_MOVESE: begin
-        if (ext[11]) `MEMX(ea_addr, sz, 1'b1, R[ext[15:12]], dfc, S_END)   // 68020 stores post-EA An
+        if (ext[11]) `MEMX(ea_addr, sz, 1'b1, rA, dfc, S_END)   // 68020 stores post-EA An
         else         `MEMX(ea_addr, sz, 1'b0, 32'd0, sfc, S_MOVES1)
     end
     S_MOVES1: begin
-        if (ext[15]) `WR_A(ext[14:12], sxs(mem_rd, sz))
-        else D[ext[14:12]] <= merge(D[ext[14:12]], mem_rd, sz);
+        if (ext[15]) `WR_R(ext[15:12], sxs(mem_rd, sz))
+        else         `WR_D(ext[14:12], mem_rd, sz)
         state <= S_END;
     end
 

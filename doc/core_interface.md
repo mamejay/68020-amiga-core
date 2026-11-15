@@ -3,6 +3,7 @@
 ```systemverilog
 module m68020_core (
   input  logic        clk,
+  input  logic        ce,           // clock enable: the core only advances on clk edges with ce=1
   input  logic        rst_n,        // synchronous active-low reset; core starts reset vector fetch after release
 
   // ---- unified bus (instruction + data), one outstanding transfer ----
@@ -39,3 +40,5 @@ Rules
 * Instruction fetches are long-word (size 2) reads at 4-byte-aligned addresses, fc = 2/6.
 * Interrupt acknowledge: read, size byte, fc = 7, addr = 32'hFFFFFFF1 | (level << 1). Slave returns vector in rdata[7:0], or asserts bus_avec with bus_ack.
 * Reset sequence: long read of SSP at 0, long read of PC at 4 (fc = 6? -> real 68020 uses fc=5 data? we use 6 for both).
+* All inputs (bus_ack, bus_berr, bus_avec, bus_rdata, ipl) are sampled only on clock edges where ce=1.
+  A slave must therefore hold bus_ack/bus_berr until an edge with ce=1 (or run with ce tied high).

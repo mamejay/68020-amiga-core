@@ -1850,7 +1850,9 @@ static inline void m68ki_stack_frame_1011(uint sr, uint vector, uint pc)
  */
 static inline void m68ki_exception_trap(uint vector)
 {
+	uint tracing = m68ki_tracing;   /* 68020 UM: trace is taken after trap-class exceptions */
 	uint sr = m68ki_init_exception();
+	m68ki_tracing = tracing;
 
 	if(CPU_TYPE_IS_010_LESS(CPU_TYPE))
 		m68ki_stack_frame_0000(REG_PC, sr, vector);
@@ -1875,7 +1877,9 @@ static inline void m68ki_exception_trapN(uint vector)
 	if (m68ki_trap_callback(t))
 	    return;
 
+	uint tracing = m68ki_tracing;
 	uint sr = m68ki_init_exception();
+	m68ki_tracing = tracing;
 	m68ki_stack_frame_0000(REG_PC, sr, vector);
 	m68ki_jump_vector(vector);
 

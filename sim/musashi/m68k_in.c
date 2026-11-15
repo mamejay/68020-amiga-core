@@ -7795,7 +7795,7 @@ M68KMAKE_OP(nbcd, 8, ., .)
 	{
 		FLAG_V = VFLAG_CLEAR;
 		FLAG_C = CFLAG_CLEAR;
-		FLAG_X = XFLAG_CLEAR;
+		FLAG_X = XFLAG_CLEAR;		m68ki_write_8(ea, 0);   /* real CPU always writes the result (0) */
 	}
 	FLAG_N = NFLAG_8(res);	/* Undefined N behavior */
 }
@@ -9289,6 +9289,15 @@ rte_loop:
 				new_pc = m68ki_pull_32();
 				m68ki_fake_pull_16();	/* format word */
 				m68ki_fake_pull_32();	/* address */
+				m68ki_jump(new_pc);
+				m68ki_set_sr(new_sr);
+				CPU_INSTR_MODE = INSTRUCTION_YES;
+				CPU_RUN_MODE = RUN_MODE_NORMAL;
+				return;
+			case 9: case 10: case 11: /* coprocessor mid-instr / bus fault: restore SR+PC, restart */
+				new_sr = m68ki_pull_16();
+				new_pc = m68ki_pull_32();
+				REG_A[7] += (format_word == 9) ? 14 : (format_word == 10) ? 26 : 86;
 				m68ki_jump(new_pc);
 				m68ki_set_sr(new_sr);
 				CPU_INSTR_MODE = INSTRUCTION_YES;

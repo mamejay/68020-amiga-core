@@ -23,5 +23,6 @@ module tb (
   output logic [255:0] dbg_a,
   output logic [31:0] dbg_usp, dbg_isp, dbg_msp, dbg_vbr
 );
+  wire ce = 1'b1;
   m68020_core u_core (.*);
 endmodule
