@@ -25,3 +25,4 @@ syn/arith.txt
 syn/bit/out/
 sim/lockstep_fx3
 sim/obj_fx3/
+syn/gl/out*/

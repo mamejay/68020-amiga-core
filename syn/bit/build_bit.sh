@@ -17,12 +17,14 @@ cp $R/*.mem $O/
 SRCS="$R/autoconfig_zii.v $R/fastmem_zii.v $R/fifo.v $R/rx_cpu_buf.v $R/tx_cpu_buf.v $R/sd_subsystem.v $R/sdcard.v $R/sdram_ctrl.v $R/shifter.v $R/turbomem_zii.v"
 cd $O
 if [ ! -f synth.json ] || [ ../../../../rtl/m68020_core.sv -nt synth.json ] || [ ../../../../rtl/m68020_fx68k.sv -nt synth.json ]; then
-  echo "== yosys"; yosys -q -l synth.log -p "read_verilog -sv ../../../../rtl/m68020_core.sv ../../../../rtl/m68020_fx68k.sv base64_top_020.sv; read_verilog ${SRCS//$R/../../$R}; synth_ecp5 -top base64_top -json synth.json"
+  echo "== yosys"; yosys -q -l synth.log -p "read_verilog -sv -DM68020_CE_POSTMAP ../../../../rtl/m68020_core.sv ../../../../rtl/m68020_fx68k.sv base64_top_020.sv; read_verilog ${SRCS//$R/../../$R}; synth_ecp5 -top base64_top -json synth.json"
 fi
+# the core's clock enable goes onto every core register's enable pin (see ce_post.py)
+python3 ../../ce_post.py synth.json synth_ce.json
 python3 ../../mklpf.py ../../$L synth.json base64_nextpnr.lpf
 echo "== nextpnr (seed $SEED)"
 # core_clk_split/join: the core gets its own clock net during placement only (see the scripts)
-CE_DIV=$CE_DIV nextpnr-ecp5 --25k --package CABGA256 --speed 6 --json synth.json --lpf base64_nextpnr.lpf \
+CE_DIV=$CE_DIV nextpnr-ecp5 --25k --package CABGA256 --speed 6 --json synth_ce.json --lpf base64_nextpnr.lpf \
     --timing-allow-fail --seed $SEED --pre-place ../../core_clk_split.py --pre-route ../../core_clk_join.py \
     --textcfg base64.config --write routed.json --report report.json --sdf routed.sdf -l pnr.log > pnr.out 2>&1
 grep -E "core_clk_(split|join)" pnr.out

@@ -24,6 +24,14 @@
 /* verilator lint_off CASEOVERLAP */
 /* verilator lint_off UNUSEDPARAM */
 
+// M68020_CE_POSTMAP (FPGA builds, syn/bit/build_bit.sh): the core is synthesised as its own
+// netlist module with the clock enable tied off, and syn/bit/ce_post.py then puts `ce` on the
+// enable of every register and memory port of that module, one LUT from the flop. Left to
+// itself, synthesis folds `ce` into the next-state logic up to 7 LUTs deep, and `ce` is the one
+// signal into the core that must settle within a single clock.
+`ifdef M68020_CE_POSTMAP
+(* keep_hierarchy *)
+`endif
 module m68020_core #(
     parameter int RESET_CYCLES = 1024,   // length of RESET instruction pulse
     parameter bit ICACHE       = 1'b1,   // implement 64-entry instruction cache
@@ -60,6 +68,12 @@ module m68020_core #(
     output logic [31:0]  dbg_msp,
     output logic [31:0]  dbg_vbr
 );
+
+`ifdef M68020_CE_POSTMAP
+wire ce_i = 1'b1;   // ce is applied after synthesis (see above)
+`else
+wire ce_i = ce;
+`endif
 
 // -----------------------------------------------------------------------------
 // constants
@@ -491,7 +505,7 @@ wire         ib_hit = ib_valid && (ib_tag == PC[31:2]);
 wire         iw_hit = ib_hit;
 wire  [15:0] iw = PC[1] ? ib_data[15:0] : ib_data[31:16];
 
-wire ic_we = ICACHE && ce && (state == S_IFETCH) && bus_ack && cacr[0] && !cacr[1];
+wire ic_we = ICACHE && ce_i && (state == S_IFETCH) && bus_ack && cacr[0] && !cacr[1];
 always_ff @(posedge clk) begin
     if (ic_we) begin
         ic_data[bus_addr[7:2]] <= bus_rdata;
@@ -745,7 +759,7 @@ wire [31:0] bus_addr_end = bus_addr + ((bus_size == SZ_L) ? 32'd3 : (bus_size ==
 // -----------------------------------------------------------------------------
 // debug outputs (shadow copy of the register file)
 // -----------------------------------------------------------------------------
-assign dbg_retire = retire_q && ce;      // pulse in the cycle after the next opcode was fetched
+assign dbg_retire = retire_q && ce;        // pulse in the cycle after the next opcode was fetched
 assign dbg_pc  = PCi;                    // = address of that next instruction
 assign dbg_sr  = sr;
 assign dbg_vbr = vbr;
@@ -776,7 +790,7 @@ endgenerate
 // main FSM
 // -----------------------------------------------------------------------------
 
-always_ff @(posedge clk) if (ce) begin
+always_ff @(posedge clk) if (ce_i) begin
     w_en = 1'b0; w_a = 5'd0; w_d = 32'd0; w_sz = SZ_L;
     // interrupt input sampling
     ipl_q    <= ipl;
