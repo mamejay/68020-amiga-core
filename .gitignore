@@ -26,3 +26,8 @@ syn/bit/out/
 sim/lockstep_fx3
 sim/obj_fx3/
 syn/gl/out*/
+sim/b64/obj*/
+sim/b64/*.log
+sim/b64/*.mem
+sim/b64/top_020.sv
+syn/bit/*.log
