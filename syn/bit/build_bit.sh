@@ -30,7 +30,9 @@ CE_DIV=$CE_DIV nextpnr-ecp5 --25k --package CABGA256 --speed 6 --json synth_ce.j
 grep -E "core_clk_(split|join)" pnr.out
 grep -E "TRELLIS_COMB:|TRELLIS_FF:|DP16KD:|MULT18X18D:" pnr.log | tail -4
 echo "== ecppack"
-ecppack --compress --freq 62.0 --spimode dual-spi --input base64.config --bit base64_m68020.bit
+# No --spimode: Diamond's .bit (the working fx68k-v1.2.2 release) has no SPI-mode command, and
+# the dual-spi one ecppack adds is the suspected reason earlier builds were dead on hardware.
+ecppack --compress --freq 62.0 --input base64.config --bit base64_m68020.bit
 ls -l base64_m68020.bit
 echo "== timing sign-off (multicycle-aware, from the routed SDF)"
 python3 ../../sta_sdf.py routed.json routed.sdf $CE_DIV | tee sta.txt | sed -n '/launch->capture/,/^$/p;/RESULT/p' || true

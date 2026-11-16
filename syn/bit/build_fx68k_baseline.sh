@@ -14,5 +14,5 @@ nextpnr-ecp5 --25k --package CABGA256 --speed 6 --json synth.json --lpf base64_n
     --timing-allow-fail --seed 1 --textcfg base64.config --write routed.json --sdf routed.sdf -l pnr.log > /dev/null 2>&1
 grep -E "TRELLIS_COMB:|TRELLIS_FF:|Max frequency" pnr.log | tail -4
 # same packing options as build_bit.sh, so this bitstream differs from the m68020 one only in the CPU
-ecppack --compress --freq 62.0 --spimode dual-spi --input base64.config --bit base64_fx68k_nextpnr.bit
+ecppack --compress --freq 62.0 --input base64.config --bit base64_fx68k_nextpnr.bit
 ls -l base64_fx68k_nextpnr.bit
