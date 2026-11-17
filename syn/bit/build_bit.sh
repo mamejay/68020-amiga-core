@@ -13,6 +13,25 @@ L=../../ref/base64_gateware/fx68k/constraints/base64.lpf
 O=out/cediv$CE_DIV; mkdir -p $O
 sed "s/^\(\s*\)fx68k cpu (/\1m68020_fx68k #(.CE_DIV($CE_DIV)) cpu (/" $R/base64_top.sv > $O/base64_top_020.sv
 grep -q "m68020_fx68k #(.CE_DIV($CE_DIV)) cpu (" $O/base64_top_020.sv || { echo "instance patch failed"; exit 1; }
+# SD DAT0 (MISO) / DAT1 / DAT2: the reference releases them with `assign sd_d[n] = 1'bz`. Diamond
+# makes those inputs, but yosys turns the constant z into a driven 0, so the FPGA pulls MISO low
+# and fights the card (card never answers -> sfsd.device finds no disk). Use explicit ECP5 BB
+# pads with the output permanently disabled, and read MISO from the pad.
+python3 - $O/base64_top_020.sv <<'EOF'
+import sys, re
+p = sys.argv[1]; s = open(p).read()
+old_z = "    assign sd_d[3]     = sd_ss_n_i;\n    assign sd_d[2:1]   = 2'bzz;\n    assign sd_d[0]     = 1'bz;\n"
+new_z = ("    wire sd_miso_pad;\n"
+         "    BB sd_d3_bb (.I(sd_ss_n_i), .T(1'b0), .O(), .B(sd_d[3]));\n"
+         "    BB sd_d0_bb (.I(1'b0), .T(1'b1), .O(sd_miso_pad), .B(sd_d[0]));\n"
+         "    BB sd_d1_bb (.I(1'b0), .T(1'b1), .O(), .B(sd_d[1]));\n"
+         "    BB sd_d2_bb (.I(1'b0), .T(1'b1), .O(), .B(sd_d[2]));\n")
+assert s.count(old_z) == 1, "sd_d z-assign not found"
+s = s.replace(old_z, new_z)
+s, n = re.subn(r"\.sd_miso(\s*)\(sd_d\[0\]\)", r".sd_miso\1(sd_miso_pad)", s)
+assert n == 1, "sd_miso hookup not found"
+open(p, "w").write(s)
+EOF
 cp $R/*.mem $O/
 SRCS="$R/autoconfig_zii.v $R/fastmem_zii.v $R/fifo.v $R/rx_cpu_buf.v $R/tx_cpu_buf.v $R/sd_subsystem.v $R/sdcard.v $R/sdram_ctrl.v $R/shifter.v $R/turbomem_zii.v"
 cd $O
